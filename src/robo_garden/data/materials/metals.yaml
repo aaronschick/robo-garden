@@ -1,0 +1,44 @@
+materials:
+  - id: aluminum_6061
+    name: "Aluminum 6061-T6"
+    type: metal
+    density_kg_m3: 2700.0
+    yield_strength_mpa: 276.0
+    elastic_modulus_gpa: 68.9
+    printable: false
+    cost_per_kg_usd: 8.0
+    max_temp_c: 300.0
+    notes: "Standard structural aluminum. CNC machinable. Good strength-to-weight."
+
+  - id: aluminum_7075
+    name: "Aluminum 7075-T6"
+    type: metal
+    density_kg_m3: 2810.0
+    yield_strength_mpa: 503.0
+    elastic_modulus_gpa: 71.7
+    printable: false
+    cost_per_kg_usd: 15.0
+    max_temp_c: 300.0
+    notes: "High-strength aluminum. Used in aerospace. More expensive to machine."
+
+  - id: steel_304
+    name: "Stainless Steel 304"
+    type: metal
+    density_kg_m3: 8000.0
+    yield_strength_mpa: 215.0
+    elastic_modulus_gpa: 193.0
+    printable: false
+    cost_per_kg_usd: 5.0
+    max_temp_c: 800.0
+    notes: "Common stainless steel. Heavy. Used for fasteners, shafts, bearings."
+
+  - id: carbon_fiber_tube
+    name: "Carbon Fiber Tube (Pultruded)"
+    type: composite
+    density_kg_m3: 1600.0
+    yield_strength_mpa: 600.0
+    elastic_modulus_gpa: 135.0
+    printable: false
+    cost_per_kg_usd: 80.0
+    max_temp_c: 150.0
+    notes: "Extremely stiff and light. Standard tubes/rods available. Not easily custom shaped."

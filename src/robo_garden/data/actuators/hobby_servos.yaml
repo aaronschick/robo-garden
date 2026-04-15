@@ -1,0 +1,78 @@
+actuators:
+  - id: sg90
+    name: "SG90 Micro Servo"
+    type: servo
+    torque_nm: 0.18
+    speed_rpm: 100
+    voltage: 5.0
+    weight_g: 9.0
+    price_usd: 3.00
+    max_angle_deg: 180
+    interface: pwm
+    source: towerpro
+    url: ""
+
+  - id: mg996r
+    name: "MG996R Standard Servo"
+    type: servo
+    torque_nm: 1.08
+    speed_rpm: 83
+    voltage: 6.0
+    weight_g: 55.0
+    price_usd: 8.00
+    max_angle_deg: 180
+    interface: pwm
+    source: towerpro
+    url: ""
+
+  - id: mg90s
+    name: "MG90S Micro Metal Gear Servo"
+    type: servo
+    torque_nm: 0.22
+    speed_rpm: 100
+    voltage: 5.0
+    weight_g: 13.4
+    price_usd: 5.00
+    max_angle_deg: 180
+    interface: pwm
+    source: towerpro
+    url: ""
+
+  - id: ds3218
+    name: "DS3218 20kg Digital Servo"
+    type: servo
+    torque_nm: 2.16
+    speed_rpm: 50
+    voltage: 6.8
+    weight_g: 60.0
+    price_usd: 12.00
+    max_angle_deg: 270
+    interface: pwm
+    source: dsservo
+    url: ""
+
+  - id: ld_27mg
+    name: "LD-27MG Full Metal 27kg Servo"
+    type: servo
+    torque_nm: 2.94
+    speed_rpm: 43
+    voltage: 7.4
+    weight_g: 73.0
+    price_usd: 18.00
+    max_angle_deg: 270
+    interface: pwm
+    source: hiwonder
+    url: ""
+
+  - id: lx_16a
+    name: "LX-16A Serial Bus Servo"
+    type: servo
+    torque_nm: 1.7
+    speed_rpm: 62
+    voltage: 7.4
+    weight_g: 28.3
+    price_usd: 12.00
+    max_angle_deg: 240
+    interface: ttl
+    source: lewansoul
+    url: ""

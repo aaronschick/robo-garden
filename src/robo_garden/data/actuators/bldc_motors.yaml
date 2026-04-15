@@ -1,0 +1,52 @@
+actuators:
+  - id: odrive_s1
+    name: "ODrive S1 Motor Controller + D5065 Motor"
+    type: bldc
+    torque_nm: 2.25
+    speed_rpm: 8400
+    voltage: 24.0
+    weight_g: 410.0
+    price_usd: 189.00
+    max_angle_deg: null
+    interface: canbus
+    source: odrive
+    url: "https://odriverobotics.com/shop/odrive-s1"
+
+  - id: odrive_micro
+    name: "ODrive Micro + D4215 Motor"
+    type: bldc
+    torque_nm: 0.65
+    speed_rpm: 7400
+    voltage: 24.0
+    weight_g: 180.0
+    price_usd: 99.00
+    max_angle_deg: null
+    interface: canbus
+    source: odrive
+    url: "https://odriverobotics.com/shop/odrive-micro"
+
+  - id: mjbots_qdd100
+    name: "mjbots qdd100 Quasi-Direct-Drive Actuator"
+    type: bldc
+    torque_nm: 16.0
+    speed_rpm: 500
+    voltage: 44.0
+    weight_g: 480.0
+    price_usd: 549.00
+    max_angle_deg: null
+    interface: canbus
+    source: mjbots
+    url: "https://mjbots.com/products/qdd100-beta-3"
+
+  - id: myactuator_rmd_x8
+    name: "MyActuator RMD-X8 Integrated Servo"
+    type: bldc
+    torque_nm: 9.0
+    speed_rpm: 280
+    voltage: 48.0
+    weight_g: 485.0
+    price_usd: 299.00
+    max_angle_deg: null
+    interface: canbus
+    source: myactuator
+    url: "https://www.myactuator.com/product-page/rmd-x8"

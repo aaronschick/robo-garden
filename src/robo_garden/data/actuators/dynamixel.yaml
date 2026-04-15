@@ -1,0 +1,104 @@
+actuators:
+  - id: dynamixel_xl330_m077
+    name: "Dynamixel XL330-M077-T"
+    type: servo
+    torque_nm: 0.52
+    speed_rpm: 379
+    voltage: 5.0
+    weight_g: 18.5
+    price_usd: 24.00
+    max_angle_deg: 360
+    interface: ttl
+    source: robotis
+    url: "https://www.robotis.us/dynamixel-xl330-m077-t/"
+
+  - id: dynamixel_xl330_m288
+    name: "Dynamixel XL330-M288-T"
+    type: servo
+    torque_nm: 0.42
+    speed_rpm: 103
+    voltage: 5.0
+    weight_g: 18.5
+    price_usd: 24.00
+    max_angle_deg: 360
+    interface: ttl
+    source: robotis
+    url: "https://www.robotis.us/dynamixel-xl330-m288-t/"
+
+  - id: dynamixel_xl430_w250
+    name: "Dynamixel XL430-W250-T"
+    type: servo
+    torque_nm: 1.5
+    speed_rpm: 57
+    voltage: 11.1
+    weight_g: 57.2
+    price_usd: 49.90
+    max_angle_deg: 360
+    interface: ttl
+    source: robotis
+    url: "https://www.robotis.us/dynamixel-xl430-w250-t/"
+
+  - id: dynamixel_xm430_w210
+    name: "Dynamixel XM430-W210-T"
+    type: servo
+    torque_nm: 2.7
+    speed_rpm: 77
+    voltage: 12.0
+    weight_g: 82.0
+    price_usd: 269.90
+    max_angle_deg: 360
+    interface: ttl
+    source: robotis
+    url: "https://www.robotis.us/dynamixel-xm430-w210-t/"
+
+  - id: dynamixel_xm430_w350
+    name: "Dynamixel XM430-W350-T"
+    type: servo
+    torque_nm: 4.1
+    speed_rpm: 46
+    voltage: 12.0
+    weight_g: 82.0
+    price_usd: 269.90
+    max_angle_deg: 360
+    interface: ttl
+    source: robotis
+    url: "https://www.robotis.us/dynamixel-xm430-w350-t/"
+
+  - id: dynamixel_xm540_w150
+    name: "Dynamixel XM540-W150-T"
+    type: servo
+    torque_nm: 6.9
+    speed_rpm: 66
+    voltage: 12.0
+    weight_g: 165.0
+    price_usd: 329.90
+    max_angle_deg: 360
+    interface: ttl
+    source: robotis
+    url: "https://www.robotis.us/dynamixel-xm540-w150-t/"
+
+  - id: dynamixel_xm540_w270
+    name: "Dynamixel XM540-W270-T"
+    type: servo
+    torque_nm: 10.6
+    speed_rpm: 37
+    voltage: 12.0
+    weight_g: 165.0
+    price_usd: 329.90
+    max_angle_deg: 360
+    interface: ttl
+    source: robotis
+    url: "https://www.robotis.us/dynamixel-xm540-w270-t/"
+
+  - id: dynamixel_xh540_w270
+    name: "Dynamixel XH540-W270-T"
+    type: servo
+    torque_nm: 9.2
+    speed_rpm: 34
+    voltage: 24.0
+    weight_g: 165.0
+    price_usd: 399.90
+    max_angle_deg: 360
+    interface: rs485
+    source: robotis
+    url: "https://www.robotis.us/dynamixel-xh540-w270-t/"

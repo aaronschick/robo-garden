@@ -1,0 +1,77 @@
+materials:
+  - id: pla_standard
+    name: "PLA (Standard)"
+    type: 3d_print
+    density_kg_m3: 1240.0
+    yield_strength_mpa: 50.0
+    elastic_modulus_gpa: 3.5
+    printable: true
+    cost_per_kg_usd: 20.0
+    max_temp_c: 55.0
+    notes: "Most common FDM material. Easy to print. Brittle under impact. Not for outdoor/heat."
+
+  - id: petg_standard
+    name: "PETG (Standard)"
+    type: 3d_print
+    density_kg_m3: 1270.0
+    yield_strength_mpa: 50.0
+    elastic_modulus_gpa: 2.1
+    printable: true
+    cost_per_kg_usd: 22.0
+    max_temp_c: 75.0
+    notes: "Good balance of strength and flexibility. More impact resistant than PLA."
+
+  - id: abs_standard
+    name: "ABS (Standard)"
+    type: 3d_print
+    density_kg_m3: 1040.0
+    yield_strength_mpa: 40.0
+    elastic_modulus_gpa: 2.3
+    printable: true
+    cost_per_kg_usd: 22.0
+    max_temp_c: 95.0
+    notes: "Good heat resistance. Needs enclosed printer. Acetone smoothable."
+
+  - id: tpu_95a
+    name: "TPU 95A (Flexible)"
+    type: elastomer
+    density_kg_m3: 1210.0
+    yield_strength_mpa: 26.0
+    elastic_modulus_gpa: 0.03
+    printable: true
+    cost_per_kg_usd: 35.0
+    max_temp_c: 80.0
+    notes: "Flexible/elastic. Ideal for feet, grippers, bumpers, shock absorption."
+
+  - id: nylon_pa12
+    name: "Nylon PA12"
+    type: 3d_print
+    density_kg_m3: 1020.0
+    yield_strength_mpa: 50.0
+    elastic_modulus_gpa: 1.6
+    printable: true
+    cost_per_kg_usd: 45.0
+    max_temp_c: 110.0
+    notes: "Strong, tough, fatigue resistant. Absorbs moisture. Needs dry box."
+
+  - id: pla_cf
+    name: "PLA Carbon Fiber Filled"
+    type: composite
+    density_kg_m3: 1300.0
+    yield_strength_mpa: 65.0
+    elastic_modulus_gpa: 5.5
+    printable: true
+    cost_per_kg_usd: 40.0
+    max_temp_c: 55.0
+    notes: "Stiffer than PLA. Good for structural frames. Requires hardened nozzle."
+
+  - id: nylon_cf
+    name: "Nylon Carbon Fiber Filled"
+    type: composite
+    density_kg_m3: 1150.0
+    yield_strength_mpa: 80.0
+    elastic_modulus_gpa: 6.0
+    printable: true
+    cost_per_kg_usd: 65.0
+    max_temp_c: 120.0
+    notes: "Excellent stiffness-to-weight. Best structural FDM material. Requires hardened nozzle + dry box."
