@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 import mujoco
 
-from robo_garden.building.models import ActuatorAssignment
+from robo_garden.building.models import ActuatorAssignment, MaterialAssignment
 
 
 @dataclass
@@ -23,6 +23,7 @@ class ValidationReport:
 def validate_buildability(
     model: mujoco.MjModel,
     actuator_assignments: list[ActuatorAssignment],
+    material_assignments: list[MaterialAssignment] | None = None,
 ) -> ValidationReport:
     """Check that a robot design is physically buildable with assigned components.
 
@@ -30,7 +31,9 @@ def validate_buildability(
     - Joint torque requirements vs actuator capabilities
     - Total mass budget
     - Joint range compatibility
-    - Estimated cost
+    - Estimated actuator cost
+    - Material assignments vs MJCF body names
+    - Material printability (informational)
     """
     report = ValidationReport()
 
@@ -42,27 +45,50 @@ def validate_buildability(
     if total_mass > 50:
         report.warnings.append(f"Robot mass ({total_mass:.1f}kg) is very heavy for a prototype")
 
+    # Build a map: joint name → joint index for subtree mass lookup
+    joint_name_to_idx: dict[str, int] = {}
+    for i in range(model.njnt):
+        jname = model.joint(i).name
+        joint_name_to_idx[jname] = i
+
     # Check actuator assignments
     total_cost = 0.0
     has_cost = True
     for assignment in actuator_assignments:
         actuator = assignment.actuator
 
-        # Estimate required torque (mass * gravity * max_lever_arm heuristic)
-        # This is a rough check - proper static analysis would need full kinematics
-        per_joint_mass = total_mass / max(model.njnt, 1)
-        estimated_torque = per_joint_mass * 9.81 * 0.1  # 10cm lever arm estimate
+        # Estimate required torque using subtree mass at the joint's body when available.
+        # model.body_subtreemass[body_id] = total mass of body + all descendants.
+        # This gives a better per-joint load estimate than dividing total mass evenly.
+        j_idx = joint_name_to_idx.get(assignment.joint_name)
+        if j_idx is not None:
+            body_id = int(model.jnt_bodyid[j_idx])
+            subtree_mass = float(model.body_subtreemass[body_id])
+        else:
+            # Joint not found in compiled model — fall back to even split
+            subtree_mass = total_mass / max(model.njnt, 1)
 
-        if estimated_torque > actuator.torque_nm * assignment.gear_ratio:
+        # 10 cm lever arm is a conservative heuristic for a typical limb segment
+        estimated_torque = subtree_mass * 9.81 * 0.1
+        capacity = actuator.torque_nm * assignment.gear_ratio
+
+        if estimated_torque > capacity:
             report.errors.append(
                 f"Joint '{assignment.joint_name}': estimated torque {estimated_torque:.2f}Nm "
-                f"exceeds {actuator.name} capacity {actuator.torque_nm * assignment.gear_ratio:.2f}Nm"
+                f"exceeds {actuator.name} capacity {capacity:.2f}Nm"
             )
             report.passed = False
         else:
             report.checks.append(
                 f"Joint '{assignment.joint_name}': {actuator.name} OK "
-                f"({estimated_torque:.2f}/{actuator.torque_nm * assignment.gear_ratio:.2f}Nm)"
+                f"({estimated_torque:.2f}/{capacity:.2f}Nm)"
+            )
+
+        # Speed check: very slow actuators are unsuitable for dynamic locomotion joints
+        if actuator.speed_rpm < 30:
+            report.warnings.append(
+                f"Joint '{assignment.joint_name}': {actuator.name} speed "
+                f"({actuator.speed_rpm:.0f} RPM) may be too slow for dynamic motion"
             )
 
         if actuator.price_usd is not None:
@@ -71,7 +97,27 @@ def validate_buildability(
             has_cost = False
 
     report.total_cost_usd = total_cost if has_cost else None
-    if has_cost:
+    if has_cost and actuator_assignments:
         report.checks.append(f"Estimated actuator cost: ${total_cost:.2f}")
+
+    # Check material assignments
+    if material_assignments:
+        body_names = {model.body(i).name for i in range(model.nbody)}
+        for assignment in material_assignments:
+            if assignment.link_name not in body_names:
+                report.warnings.append(
+                    f"Material assigned to unknown link '{assignment.link_name}'"
+                )
+                continue
+            mat = assignment.material
+            if not mat.printable:
+                report.warnings.append(
+                    f"Link '{assignment.link_name}': {mat.name} requires machining "
+                    f"(not 3D-printable)"
+                )
+            report.checks.append(
+                f"Link '{assignment.link_name}': {mat.name} "
+                f"(strength={mat.yield_strength_mpa}MPa, density={mat.density_kg_m3}kg/m\u00b3)"
+            )
 
     return report

@@ -64,7 +64,28 @@ def validate_urdf(xml_string: str) -> ValidationResult:
         errors.append(f"URDF compilation failed: {e}")
         return ValidationResult(valid=False, errors=errors, warnings=warnings)
 
+    if model.nbody < 2:
+        warnings.append("Robot has fewer than 2 bodies (only worldbody)")
+    if model.njnt == 0:
+        warnings.append("Robot has no joints")
+    # URDF robots commonly have nu==0 (no <transmission> tags); less alarming than MJCF
+    if model.nu == 0:
+        warnings.append("No actuators compiled from URDF — add <transmission> tags for control")
+
     return ValidationResult(valid=True, errors=errors, warnings=warnings, model=model)
+
+
+def detect_format(xml_string: str) -> str:
+    """Return 'urdf' if root element is <robot ...>, else 'mjcf'."""
+    stripped = xml_string.lstrip("\ufeff \t\n\r")  # strip BOM + whitespace
+    return "urdf" if stripped.startswith("<robot") else "mjcf"
+
+
+def validate_robot_xml(xml_string: str) -> ValidationResult:
+    """Auto-detect format (MJCF or URDF) and validate."""
+    if detect_format(xml_string) == "urdf":
+        return validate_urdf(xml_string)
+    return validate_mjcf(xml_string)
 
 
 def load_mjcf_file(path: Path) -> mujoco.MjModel:

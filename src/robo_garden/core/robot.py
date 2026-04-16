@@ -35,15 +35,15 @@ class Robot:
         """Compile the MJCF XML into a MuJoCo model."""
         return mujoco.MjModel.from_xml_string(self.mjcf_xml)
 
-    def save(self, directory: Path) -> Path:
-        """Save robot MJCF to a file."""
+    def save(self, directory: Path, extension: str = ".xml") -> Path:
+        """Save robot XML to a file. Use extension='.urdf' for URDF robots."""
         directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"{self.name}.xml"
-        path.write_text(self.mjcf_xml)
+        path = directory / f"{self.name}{extension}"
+        path.write_text(self.mjcf_xml, encoding="utf-8")
         return path
 
     @classmethod
     def load(cls, path: Path) -> Robot:
         """Load a robot from an MJCF file."""
-        xml = path.read_text()
+        xml = path.read_text(encoding="utf-8")
         return cls(name=path.stem, mjcf_xml=xml)

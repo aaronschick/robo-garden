@@ -40,3 +40,16 @@ class CurriculumManager:
                      f"{self.config.stages[self.current_stage].name}")
             return True
         return False
+
+    def get_env_params(self, stage_index: int) -> dict:
+        """Return physics parameter overrides for a given curriculum stage."""
+        if not self.config.stages or stage_index >= len(self.config.stages):
+            return {}
+        stage = self.config.stages[stage_index]
+        difficulty = stage_index / max(len(self.config.stages) - 1, 1)
+        return {
+            "gravity_scale": 1.0,
+            "friction_range": (max(0.3, 1.0 - difficulty * 0.4), min(1.5, 1.0 + difficulty * 0.4)),
+            "stage_name": stage.name,
+            "difficulty": difficulty,
+        }

@@ -49,6 +49,8 @@ def simulate(
 
     diverged = False
     initial_com_z = None
+    initial_root_x = 0.0
+    energy_accum = 0.0
 
     for i in range(num_steps):
         # Apply control
@@ -60,18 +62,24 @@ def simulate(
 
         mujoco.mj_step(model, data)
 
+        # Energy: use actuator_velocity (correct mapping for any joint layout)
+        if model.nu > 0:
+            energy_accum += float(
+                np.sum(np.abs(data.ctrl * data.actuator_velocity)) * model.opt.timestep
+            )
+
         # Record state
         qpos_traj[i] = data.qpos.copy()
         qvel_traj[i] = data.qvel.copy()
 
-        # Compute center of mass
+        # Center of mass — data.subtree_com is already updated by mj_step
         com = np.zeros(3)
-        mujoco.mj_subtreeVel(model, data)  # Updates subtree COM
         com[:] = data.subtree_com[0]  # Root body COM
         com_traj[i] = com
 
         if initial_com_z is None:
             initial_com_z = com[2]
+            initial_root_x = com[0]
 
         # Check for divergence
         if np.any(np.isnan(data.qpos)) or np.any(np.isnan(data.qvel)):
@@ -98,5 +106,13 @@ def simulate(
             "initial_com_z": float(initial_com_z) if initial_com_z else 0.0,
             "final_com_z": float(com_traj[min(i, num_steps - 1), 2]),
             "max_velocity": float(np.max(np.abs(qvel_traj[: i + 1]))),
+            "forward_velocity": (
+                float(com_traj[min(i, num_steps - 1), 0]) - initial_root_x
+            ) / max(duration, 1e-6)
+                if model.nq > model.nv else 0.0,
+            "energy": energy_accum,
+            "energy_efficiency": abs(
+                (float(com_traj[min(i, num_steps - 1), 0]) - initial_root_x) / max(duration, 1e-6)
+            ) / max(energy_accum, 1e-6) if model.nq > model.nv else 0.0,
         },
     )

@@ -8,11 +8,11 @@ TOOLS = [
     {
         "name": "generate_robot",
         "description": (
-            "Generate a robot description in MJCF XML format based on a design specification. "
-            "Provide the full MJCF XML string, a list of joint names with their intended actuators "
+            "Generate a robot description in MJCF or URDF format based on a design specification. "
+            "Provide the full robot XML string, a list of joint names with their intended actuators "
             "from the actuator database, and material assignments for each link. The robot must be "
-            "physically buildable with real-world components. Returns validation results including "
-            "any constraint violations."
+            "physically buildable with real-world components. Returns validation results and "
+            "buildability analysis including any torque/material constraint violations."
         ),
         "input_schema": {
             "type": "object",
@@ -21,9 +21,19 @@ TOOLS = [
                     "type": "string",
                     "description": "Robot name identifier (alphanumeric + underscores)",
                 },
-                "mjcf_xml": {
+                "robot_xml": {
                     "type": "string",
-                    "description": "Complete MJCF XML string defining the robot",
+                    "description": "Complete robot XML string (MJCF or URDF depending on 'format')",
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["mjcf", "urdf"],
+                    "description": (
+                        "Robot description format. Use 'mjcf' (default) for complex actuator/contact "
+                        "specs, tendons, and sensors. Use 'urdf' for ROS-compatible robots or simpler "
+                        "kinematic chains."
+                    ),
+                    "default": "mjcf",
                 },
                 "actuator_assignments": {
                     "type": "array",
@@ -55,7 +65,7 @@ TOOLS = [
                     "description": "Text description of the robot design",
                 },
             },
-            "required": ["name", "mjcf_xml"],
+            "required": ["name", "robot_xml"],
         },
     },
     {
@@ -63,7 +73,10 @@ TOOLS = [
         "description": (
             "Run a physics simulation of a robot in an environment for a specified duration. "
             "Returns state time-series (joint positions, velocities, COM trajectory), "
-            "stability assessment, and performance metrics."
+            "stability assessment, and performance metrics. "
+            "Set render_video=true to save an MP4 to workspace/renders/ using the local "
+            "MuJoCo renderer — no external tools required. The result will include video_path "
+            "on success or video_error if rendering failed."
         ),
         "input_schema": {
             "type": "object",
@@ -89,7 +102,7 @@ TOOLS = [
                 },
                 "render_video": {
                     "type": "boolean",
-                    "description": "Whether to save rendered video frames",
+                    "description": "Save an MP4 video of the simulation using the local MuJoCo renderer. No Isaac Sim needed.",
                     "default": False,
                 },
             },
@@ -232,15 +245,10 @@ TOOLS = [
                     "default": 1000000,
                 },
                 "curriculum_stages": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string"},
-                            "params": {"type": "object"},
-                            "max_timesteps": {"type": "integer"},
-                        },
-                    },
+                    "type": "integer",
+                    "description": "Number of curriculum stages (1-5). If provided, training uses progressive difficulty.",
+                    "minimum": 1,
+                    "maximum": 5,
                 },
             },
             "required": ["robot_name", "environment_name", "reward_function_id", "total_timesteps"],
@@ -262,7 +270,10 @@ TOOLS = [
                 },
                 "query": {
                     "type": "string",
-                    "description": "Natural language search query",
+                    "description": (
+                        "Natural language search query. For robots, match against names like "
+                        "'spot', 'humanoid', 'quadruped', 'ant', 'cassie', 'unitree'."
+                    ),
                 },
                 "filters": {
                     "type": "object",
