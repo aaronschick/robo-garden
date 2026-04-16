@@ -22,8 +22,9 @@ _STOP_SENTINEL = object()
 
 
 class _ShowRequest(NamedTuple):
-    mjcf_xml: str
+    mjcf_xml: str        # XML string (empty string if mjcf_path is set)
     title: str
+    mjcf_path: str = ""  # File path — used instead of mjcf_xml for catalog robots
 
 
 class SessionViewer:
@@ -44,17 +45,24 @@ class SessionViewer:
         self._lock = threading.Lock()
 
     def show(self, mjcf_xml: str, title: str = "Robo Garden — Design Preview") -> None:
-        """Open or refresh the viewer with a new robot model.
+        """Open or refresh the viewer with a new robot model (from XML string)."""
+        self._enqueue(_ShowRequest(mjcf_xml=mjcf_xml, title=title))
 
-        Safe to call from any thread. If the viewer is already open with an
-        older model, it will close and reopen with the new model within ~100ms.
+    def show_path(self, mjcf_path: str, title: str = "Robo Garden — Design Preview") -> None:
+        """Open or refresh the viewer with a robot model loaded from a file path.
+
+        Use this for catalog robots where mesh assets live next to the MJCF file.
         """
+        self._enqueue(_ShowRequest(mjcf_xml="", title=title, mjcf_path=mjcf_path))
+
+    def _enqueue(self, req: _ShowRequest) -> None:
+        """Replace any pending (unseen) update with the latest, then start thread."""
         # Replace any pending (unseen) update with the latest
         try:
             self._queue.get_nowait()
         except queue.Empty:
             pass
-        self._queue.put(_ShowRequest(mjcf_xml=mjcf_xml, title=title))
+        self._queue.put(req)
 
         with self._lock:
             if self._thread is None or not self._thread.is_alive():
@@ -63,6 +71,7 @@ class SessionViewer:
                 )
                 self._thread.start()
                 log.info("SessionViewer: background thread started")
+
 
     def close(self) -> None:
         """Signal the viewer thread to exit. Returns immediately."""
@@ -89,7 +98,10 @@ class SessionViewer:
             req: _ShowRequest = item
 
             try:
-                model = mujoco.MjModel.from_xml_string(req.mjcf_xml)
+                if req.mjcf_path:
+                    model = mujoco.MjModel.from_xml_path(req.mjcf_path)
+                else:
+                    model = mujoco.MjModel.from_xml_string(req.mjcf_xml)
             except Exception as exc:
                 log.warning(f"SessionViewer: failed to compile MJCF — {exc}")
                 continue

@@ -8,6 +8,7 @@ from typing import Callable
 
 from robo_garden.claude.client import create_client, run_agentic_loop
 from robo_garden.claude.prompts import SYSTEM_PROMPT
+from robo_garden.claude.tool_handlers import set_approval_callback
 
 
 def _resolve_prompt(text: str) -> str:
@@ -44,16 +45,40 @@ def _resolve_prompt(text: str) -> str:
 
 
 class Session:
-    """A conversation session with Claude for robot design."""
+    """A conversation session with Claude for robot design.
 
-    def __init__(self) -> None:
+    Tracks the current *phase* (``"design"`` or ``"training"``) which determines
+    which subset of tools Claude sees on each turn.  ``approve_for_training``
+    is the only path from design -> training; callers (or the Studio UI) can
+    also set ``phase`` directly when entering Training Gym mode with a
+    pre-approved manifest.
+    """
+
+    def __init__(self, phase: str = "design", enable_viewer: bool = True) -> None:
         self.session_id = str(uuid.uuid4())[:8]
         self.messages: list[dict] = []
         self.client = create_client()
         self.robots: dict[str, dict] = {}  # name -> robot data
+        self.phase: str = phase
+        self.approved_robot: str | None = None
+        self.approved_environment: str | None = None
+        self.approved_manifest: Path | None = None
 
-        from robo_garden.viewer.session_viewer import SessionViewer
-        self.viewer = SessionViewer()
+        # Register ourselves as the approval sink so `approve_for_training`
+        # flips phase automatically when Claude (or the UI) invokes it.
+        set_approval_callback(self._handle_approval)
+
+        self.viewer = None
+        if enable_viewer:
+            from robo_garden.viewer.session_viewer import SessionViewer
+            self.viewer = SessionViewer()
+
+    def _handle_approval(self, robot_name: str, env_name: str, manifest_path: Path) -> None:
+        """Callback fired by tool_handlers on successful approve_for_training."""
+        self.phase = "training"
+        self.approved_robot = robot_name
+        self.approved_environment = env_name
+        self.approved_manifest = manifest_path
 
     def chat(
         self,
@@ -71,27 +96,37 @@ class Session:
             on_status=on_status,
             on_tool_call=on_tool_call,
             on_tool_result=on_tool_result,
+            phase_getter=lambda: self.phase,
         )
         return response
 
     def close(self) -> None:
         """Release resources (viewer window, threads)."""
-        self.viewer.close()
+        if self.viewer is not None:
+            self.viewer.close()
 
 
 def _make_tool_result_handler(session: Session) -> Callable[[str, dict], None]:
     """Return a callback that opens/refreshes the viewer on successful generate_robot."""
     def _on_tool_result(name: str, result: dict) -> None:
         if name == "generate_robot" and result.get("success"):
-            robot_path = result.get("robot_path", "")
             robot_name = result.get("robot_name", "robot")
-            if robot_path and Path(robot_path).exists():
-                try:
-                    xml = Path(robot_path).read_text(encoding="utf-8")
-                    session.viewer.show(xml, title=f"Robo Garden — {robot_name}")
-                except Exception as exc:
-                    import logging
-                    logging.getLogger(__name__).warning(f"Viewer update failed: {exc}")
+            title = f"Robo Garden — {robot_name}"
+            try:
+                # Catalog robots: use show_path so mesh assets resolve correctly
+                if result.get("mjcf_path"):
+                    mjcf_path = result["mjcf_path"]
+                    if Path(mjcf_path).exists():
+                        session.viewer.show_path(mjcf_path, title=title)
+                # Generated robots: read XML string and show
+                elif result.get("robot_path"):
+                    robot_path = result["robot_path"]
+                    if Path(robot_path).exists():
+                        xml = Path(robot_path).read_text(encoding="utf-8")
+                        session.viewer.show(xml, title=title)
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning(f"Viewer update failed: {exc}")
     return _on_tool_result
 
 

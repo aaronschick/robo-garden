@@ -10,6 +10,7 @@ build/
 # Virtual environments
 .venv/
 venv/
+isaac-venv/
 
 # IDE
 .idea/
@@ -21,10 +22,20 @@ venv/
 # Environment variables
 .env
 
-# Workspace (runtime artifacts)
+# Workspace (runtime artifacts — prompts/ is kept because it's user-authored)
 workspace/robots/
 workspace/checkpoints/
 workspace/logs/
+workspace/approved/
+workspace/runs/
+workspace/renders/
+workspace/environments/
+
+# Claude local config / scheduled-task lockfiles
+.claude/
+
+# Scratch files written by MuJoCo when debugging
+mjmodel.xml
 
 # OS
 .DS_Store

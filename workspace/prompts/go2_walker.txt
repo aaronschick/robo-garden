@@ -1,0 +1,19 @@
+Use the Unitree Go2 quadruped robot (available as go2_mj_description in the catalog) as the
+starting point for this design session.
+
+TASK: Forward trotting gait — the robot should learn to move forward as fast as possible
+while maintaining a stable, energy-efficient trot.
+
+DESIGN GOALS:
+1. Load the Go2 base model from the catalog and register it as "go2_walker"
+2. Confirm the joint layout: 12 actuated joints (3 per leg — hip roll, hip pitch, knee)
+3. Simulate the passive (no control) model first to verify physics stability
+4. Evaluate: does the robot settle stably? What is the resting CoM height?
+5. Show me the design in the viewer and describe what you see
+
+After the initial simulation, I want to discuss:
+- Whether the default joint damping is appropriate for a trotting gait
+- Whether we need a custom environment (flat ground vs slight friction variation)
+- What reward structure makes sense for forward velocity + stability + energy
+
+Do NOT proceed to training yet — wait for my approval on each design iteration.

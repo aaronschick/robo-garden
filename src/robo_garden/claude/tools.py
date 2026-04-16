@@ -60,12 +60,21 @@ TOOLS = [
                         "required": ["link_name", "material_id"],
                     },
                 },
+                "catalog_name": {
+                    "type": "string",
+                    "description": (
+                        "Load a reference robot from the robot_descriptions catalog instead of "
+                        "providing robot_xml. Use the exact catalog key returned by query_catalog "
+                        "(e.g. 'go2_mj_description', 'spot_mj_description'). "
+                        "When set, robot_xml is not required."
+                    ),
+                },
                 "description": {
                     "type": "string",
                     "description": "Text description of the robot design",
                 },
             },
-            "required": ["name", "robot_xml"],
+            "required": ["name"],
         },
     },
     {
@@ -138,10 +147,29 @@ TOOLS = [
     {
         "name": "generate_reward",
         "description": (
-            "Generate a Python reward function for RL training. The function must have signature: "
+            "Generate a Python reward function for RL training. Signature: "
             "def compute_reward(obs, action, next_obs, info) -> tuple[float, dict]. "
-            "The dict should contain per-component reward breakdowns for analysis. "
-            "Only numpy is available in the reward function scope."
+            "The dict holds per-component reward breakdowns for analysis. Only numpy "
+            "(as np) is available.\n\n"
+            "OBSERVATION LAYOUT (identical in every training path):\n"
+            "  obs = np.concatenate([qpos, qvel])      # shape (nq + nv,)\n"
+            "  - qpos[:nq] — generalized positions; for floating-base robots the\n"
+            "    first 7 entries are [x, y, z, qw, qx, qy, qz]. Joint positions\n"
+            "    follow in MJCF declaration order.\n"
+            "  - qvel[nq:nq+nv] — generalized velocities; for floating-base robots\n"
+            "    the first 6 entries are [vx, vy, vz, wx, wy, wz] (world-frame\n"
+            "    linear + angular). Joint velocities follow.\n"
+            "  - nq / nv / nu come from the merged MJCF. Always pass robot_name so\n"
+            "    the smoke-test validates against the REAL dimensions and an index\n"
+            "    error is caught at generate-time, not mid-training.\n"
+            "\n"
+            "ACTION LAYOUT: action is a np.ndarray of shape (nu,) in [-1, 1], one\n"
+            "entry per MJCF actuator. The env scales this into each actuator's\n"
+            "ctrlrange before stepping.\n"
+            "\n"
+            "If you reference any index, assert it fits nq/nv/nu first. A safe-\n"
+            "guard wrapper returns 0.0 on IndexError during training, but the\n"
+            "smoke test raises — so fix layout bugs here."
         ),
         "input_schema": {
             "type": "object",
@@ -150,9 +178,19 @@ TOOLS = [
                     "type": "string",
                     "description": "What the robot should learn to do",
                 },
+                "robot_name": {
+                    "type": "string",
+                    "description": (
+                        "Name of the approved robot. When provided, the handler "
+                        "smoke-tests the reward with the robot's real (nq + nv) "
+                        "observation length and nu action length, so shape bugs "
+                        "are caught now instead of crashing training. "
+                        "Highly recommended."
+                    ),
+                },
                 "observation_space_description": {
                     "type": "string",
-                    "description": "Description of what the observation array contains",
+                    "description": "Optional human-readable obs description (layout above is authoritative).",
                 },
                 "reward_code": {
                     "type": "string",
@@ -252,6 +290,44 @@ TOOLS = [
                 },
             },
             "required": ["robot_name", "environment_name", "reward_function_id", "total_timesteps"],
+        },
+    },
+    {
+        "name": "approve_for_training",
+        "description": (
+            "Promote a robot + environment pair from the Design phase into the Training phase. "
+            "This tool is the ONLY bridge between design iteration and RL training. Call this when "
+            "the user has explicitly approved the current design (or click the 'Promote to Training' "
+            "button in the Studio UI). "
+            "Requires: (1) the robot has been saved via generate_robot, (2) the environment has "
+            "been saved via generate_environment, (3) a recent passive simulate call showed the "
+            "robot is stable (did not diverge). "
+            "On success: writes an approval manifest to workspace/approved/<robot>__<env>.json, "
+            "flips the session into the Training phase, and unlocks generate_reward and train. "
+            "If any precondition is missing, returns a structured error listing what still needs "
+            "to happen."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "robot_name": {
+                    "type": "string",
+                    "description": "Name of the robot previously registered via generate_robot",
+                },
+                "environment_name": {
+                    "type": "string",
+                    "description": "Name of the environment previously registered via generate_environment",
+                },
+                "notes": {
+                    "type": "string",
+                    "description": (
+                        "Short human-readable notes explaining why this design is ready for "
+                        "training (e.g. 'passive stable at 0.41m CoM, no self-collision, actuator "
+                        "torques within Dynamixel XM430 limits')."
+                    ),
+                },
+            },
+            "required": ["robot_name", "environment_name"],
         },
     },
     {

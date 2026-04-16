@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Callable  # noqa: F401  Callable used by set_approval_callback signature
 
 from robo_garden.core.simulation import SimulationResult  # noqa: F401 – for type reference
 
@@ -20,6 +20,49 @@ _MAX_REWARD_FNS = 50
 _sim_results: OrderedDict[str, SimulationResult] = OrderedDict()
 _reward_fns: OrderedDict = OrderedDict()
 
+# Catalog robot path registry: robot_name -> Path to MJCF on disk
+# Used when generate_robot loads from robot_descriptions catalog instead of XML string.
+_catalog_paths: dict[str, "Path"] = {}
+
+# Callback invoked when approve_for_training succeeds.  Set by Session to flip
+# its phase state.  Signature: (robot_name: str, environment_name: str,
+# manifest_path: Path) -> None.
+_on_approve: Any | None = None
+
+# When True, the Studio runtime (src/robo_garden/studio.py) owns the Isaac Sim
+# bridge lifecycle and will call bridge.send_robot itself from
+# Studio._on_tool_side_effects.  In that case handle_generate_robot must NOT
+# also send LOAD_ROBOT — otherwise Isaac Sim deletes and re-imports the robot,
+# racing with the kinematic-playback path and frequently leaving the viewport
+# empty.  Chat/gym modes leave this False, so the handler keeps notifying
+# Isaac directly.
+_studio_mode: bool = False
+
+
+def set_studio_mode(enabled: bool) -> None:
+    """Toggle Studio-ownership of Isaac Sim LOAD_ROBOT dispatch."""
+    global _studio_mode
+    _studio_mode = bool(enabled)
+
+
+def set_approval_callback(cb) -> None:
+    """Register a callback fired on successful approve_for_training.
+
+    Used by `Session` to flip its `phase` attribute from "design" to
+    "training" so subsequent turns advertise the training tools.
+    """
+    global _on_approve
+    _on_approve = cb
+
+
+def get_sim_result(robot_name: str):
+    """Retrieve the most recent SimulationResult for *robot_name* (or None).
+
+    Exposed so callers outside the tool-dispatch path (e.g. Studio UI gate
+    checklist) can inspect simulation state.
+    """
+    return _sim_results.get(robot_name)
+
 
 def get_reward_fn(reward_id: str):
     """Retrieve a stored reward function by ID (LRU: moves to end on access)."""
@@ -27,6 +70,96 @@ def get_reward_fn(reward_id: str):
     if rf is not None:
         _reward_fns.move_to_end(reward_id)
     return rf
+
+
+def _compute_model_dims_from_manifest(manifest: dict) -> dict:
+    """Compute nq/nv/nu/obs_dim/action_dim from the files named in *manifest*.
+
+    Used as a fallback when an older manifest was written before
+    handle_approve_for_training started persisting model_dims.  Best-effort —
+    returns {} on any failure.
+    """
+    from pathlib import Path as _P
+
+    try:
+        import mujoco
+        from robo_garden.training.mujoco_engine import _merge_mjcf
+
+        robot_path = _P(manifest.get("robot_path", ""))
+        env_path = _P(manifest.get("environment_path", ""))
+        if not robot_path.exists():
+            return {}
+
+        robot_xml = robot_path.read_text(encoding="utf-8")
+        robot_name = manifest.get("robot_name", "")
+        if robot_name in _catalog_paths:
+            robot_xml = _absolutize_asset_paths(robot_xml, robot_path.parent)
+        env_xml = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+        merged = _merge_mjcf(robot_xml, env_xml)
+        m = mujoco.MjModel.from_xml_string(merged)
+        return {
+            "nq": int(m.nq),
+            "nv": int(m.nv),
+            "nu": int(m.nu),
+            "obs_dim": int(m.nq + m.nv),
+            "action_dim": int(m.nu),
+            "floating_base": bool(m.nq > m.nv),
+        }
+    except Exception as exc:
+        log.debug(f"_compute_model_dims_from_manifest failed: {exc}")
+        return {}
+
+
+def _lookup_model_dims(robot_name: str) -> dict:
+    """Best-effort lookup of (obs_dim, action_dim, nq, nv, nu) for *robot_name*.
+
+    Reads the approval manifest written by handle_approve_for_training.  If
+    the manifest predates the model_dims field (older runs), compute them on
+    the fly from the files it references so the reward smoke-test always sees
+    real shapes.  Returns {} only when no manifest exists.
+    """
+    import json
+    from robo_garden.config import APPROVED_DIR
+
+    if not robot_name:
+        return {}
+    for path in APPROVED_DIR.glob(f"{robot_name}__*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        dims = data.get("model_dims") or {}
+        if dims and dims.get("obs_dim"):
+            return dims
+        # Manifest lacks model_dims — recover by rebuilding the model.
+        return _compute_model_dims_from_manifest(data)
+    return {}
+
+
+def _latest_approved_robot() -> str:
+    """Return the robot_name from the most-recently-written approval manifest.
+
+    Used as a fallback when Claude calls generate_reward without robot_name.
+    In practice there is at most one approval at a time (the Session gates it),
+    so "most recent" is both unambiguous and correct.
+    """
+    import json
+    from robo_garden.config import APPROVED_DIR
+
+    manifests = sorted(
+        APPROVED_DIR.glob("*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for path in manifests:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            name = data.get("robot_name", "")
+            if name:
+                return name
+        except Exception:
+            continue
+    return ""
 
 
 def register_handler(tool_name: str):
@@ -54,20 +187,151 @@ def dispatch_tool(tool_name: str, tool_input: dict) -> dict:
         return {"error": str(e)}
 
 
+# --- Helpers ---
+
+_SCENE_FLOOR_XML = """\
+<mujoco>
+  <include file="{robot_filename}"/>
+  <worldbody>
+    <light name="_scene_sun" pos="0 0 4" dir="0 0 -1" diffuse="1 1 1" castshadow="false"/>
+    <geom name="_scene_floor" type="plane" size="50 50 0.05" rgba="0.75 0.8 0.85 1"
+          contype="1" conaffinity="1" condim="3" friction="1 0.005 0.0001"/>
+  </worldbody>
+</mujoco>"""
+
+
+def _absolutize_asset_paths(xml_text: str, base_dir: "Path") -> str:
+    """Rewrite relative meshdir/texturedir paths to absolute so the XML can be
+    compiled from a string (rather than from a file next to its assets).
+    """
+    import re
+    from pathlib import Path
+
+    def _fix(m: re.Match) -> str:
+        attr, rel = m.group(1), m.group(2)
+        if Path(rel).is_absolute():
+            return m.group(0)
+        abs_path = (Path(base_dir) / rel).resolve().as_posix()
+        return f'{attr}="{abs_path}"'
+
+    # Match meshdir="..." and texturedir="..."
+    return re.sub(r'(meshdir|texturedir)="([^"]*)"', _fix, xml_text)
+
+
+def _load_model_with_scene(robot_path: "Path") -> "mujoco.MjModel":
+    """Load a MuJoCo model from *robot_path*, injecting a floor + light if the XML
+    has no ground plane geom.
+
+    For catalog robots (and any robot-only MJCF without a floor) this writes a
+    thin wrapper XML next to the original file, loads it, then removes it.
+    The wrapper uses a relative ``<include>`` so asset paths (meshdir, etc.)
+    resolve correctly from the original file's directory.
+    """
+    import mujoco
+    from pathlib import Path
+
+    robot_path = Path(robot_path)
+
+    # Quick check: does the XML mention a plane geom?
+    xml_text = robot_path.read_text(encoding="utf-8", errors="replace")
+    has_floor = 'type="plane"' in xml_text or "type='plane'" in xml_text
+
+    if has_floor:
+        return mujoco.MjModel.from_xml_path(str(robot_path))
+
+    # Inject floor by writing a wrapper next to the original (so meshdir works)
+    scene_xml = _SCENE_FLOOR_XML.format(robot_filename=robot_path.name)
+    wrapper_path = robot_path.parent / f"_rg_scene_{robot_path.stem}.xml"
+    try:
+        wrapper_path.write_text(scene_xml, encoding="utf-8")
+        return mujoco.MjModel.from_xml_path(str(wrapper_path))
+    finally:
+        wrapper_path.unlink(missing_ok=True)
+
+
 # --- Handler implementations ---
 
 
 @register_handler("generate_robot")
 def handle_generate_robot(input: dict) -> dict:
     """Validate Claude-generated robot XML (MJCF or URDF), save to workspace, notify Isaac Sim."""
-    from robo_garden.core.formats import detect_format, validate_robot_xml, model_info
+    import importlib
+    from pathlib import Path
+    from robo_garden.core.formats import detect_format, validate_robot_xml, model_info, load_mjcf_file
     from robo_garden.core.robot import Robot
     from robo_garden.config import ROBOTS_DIR
     from robo_garden.isaac import get_bridge
 
+    name = input.get("name", "unnamed")
+    catalog_name = input.get("catalog_name", "").strip()
+
+    # --- Branch: load from robot_descriptions catalog ---
+    if catalog_name:
+        try:
+            mod = importlib.import_module(f"robot_descriptions.{catalog_name}")
+        except ModuleNotFoundError:
+            return {
+                "success": False,
+                "errors": [
+                    f"Catalog entry '{catalog_name}' not found in robot_descriptions. "
+                    "Use query_catalog with catalog='robots' to list available names."
+                ],
+            }
+        mjcf_path_str = getattr(mod, "MJCF_PATH", None)
+        if not mjcf_path_str:
+            return {
+                "success": False,
+                "errors": [f"Catalog entry '{catalog_name}' has no MJCF_PATH attribute."],
+            }
+        mjcf_path = Path(mjcf_path_str)
+        if not mjcf_path.exists():
+            return {
+                "success": False,
+                "errors": [f"MJCF file not found on disk: {mjcf_path}"],
+            }
+
+        try:
+            model = load_mjcf_file(mjcf_path)
+        except Exception as exc:
+            return {"success": False, "errors": [f"MuJoCo failed to load catalog MJCF: {exc}"]}
+
+        info = model_info(model)
+        fmt = "mjcf"
+
+        # Register in catalog path registry so simulate() can find it
+        _catalog_paths[name] = mjcf_path
+
+        # Notify Isaac Sim bridge (no-op if not connected).
+        # In Studio mode the Studio runtime owns this dispatch; sending here
+        # would cause a double-load race in the viewport.
+        if not _studio_mode:
+            bridge = get_bridge()
+            bridge.send_robot(name, mjcf_path, fmt=fmt)
+
+        return {
+            "success": True,
+            "robot_name": name,
+            "format": fmt,
+            "catalog_name": catalog_name,
+            "mjcf_path": str(mjcf_path),
+            "model_info": info,
+            "warnings": [],
+            "buildability": None,
+            "note": (
+                f"Loaded from robot_descriptions.{catalog_name}. "
+                "The original MJCF file is used for simulation (mesh paths preserved)."
+            ),
+        }
+
+    # --- Branch: Claude-generated XML ---
     # Accept robot_xml (new) or mjcf_xml (backward compat)
     robot_xml = input.get("robot_xml") or input.get("mjcf_xml", "")
-    name = input.get("name", "unnamed")
+    if not robot_xml:
+        return {
+            "success": False,
+            "errors": ["Either robot_xml or catalog_name must be provided."],
+        }
+
     fmt = input.get("format") or detect_format(robot_xml)
 
     result = validate_robot_xml(robot_xml)
@@ -145,9 +409,11 @@ def handle_generate_robot(input: dict) -> dict:
             "total_cost_usd": report.total_cost_usd,
         }
 
-    # Notify Isaac Sim bridge (no-op if not connected)
-    bridge = get_bridge()
-    bridge.send_robot(name, robot_path, fmt=fmt)
+    # Notify Isaac Sim bridge (no-op if not connected).
+    # In Studio mode the Studio runtime forwards this via _on_tool_side_effects.
+    if not _studio_mode:
+        bridge = get_bridge()
+        bridge.send_robot(name, robot_path, fmt=fmt)
 
     return {
         "success": True,
@@ -172,20 +438,24 @@ def handle_simulate(input: dict) -> dict:
     duration = float(input.get("duration_seconds", 2.0))
     render_video = bool(input.get("render_video", False))
 
-    # Try .xml (MJCF) then .urdf — whichever was saved by generate_robot
-    xml_path = ROBOTS_DIR / f"{robot_name}.xml"
-    urdf_path = ROBOTS_DIR / f"{robot_name}.urdf"
-    if xml_path.exists():
-        robot_path = xml_path
-    elif urdf_path.exists():
-        robot_path = urdf_path
+    # Check catalog path registry first (robots loaded from robot_descriptions)
+    if robot_name in _catalog_paths:
+        robot_path = _catalog_paths[robot_name]
     else:
-        return {
-            "success": False,
-            "error": f"Robot '{robot_name}' not found in workspace. Call generate_robot first.",
-        }
+        # Try .xml (MJCF) then .urdf — whichever was saved by generate_robot
+        xml_path = ROBOTS_DIR / f"{robot_name}.xml"
+        urdf_path = ROBOTS_DIR / f"{robot_name}.urdf"
+        if xml_path.exists():
+            robot_path = xml_path
+        elif urdf_path.exists():
+            robot_path = urdf_path
+        else:
+            return {
+                "success": False,
+                "error": f"Robot '{robot_name}' not found in workspace. Call generate_robot first.",
+            }
 
-    model = mujoco.MjModel.from_xml_path(str(robot_path))
+    model = _load_model_with_scene(robot_path)
     result = simulate(model, duration=duration)
 
     # Store result so evaluate() can retrieve it (bounded LRU cache)
@@ -318,18 +588,50 @@ def handle_generate_environment(input: dict) -> dict:
 
 @register_handler("generate_reward")
 def handle_generate_reward(input: dict) -> dict:
-    """Validate and register a reward function."""
+    """Validate and register a reward function.
+
+    The smoke-test runs the reward against the real observation / action
+    shape whenever we can resolve an approved robot — either from the
+    explicit ``robot_name`` input or by falling back to the most recently
+    approved one.  A failing smoke-test is returned as an error so Claude
+    rewrites the reward instead of silently registering a broken function
+    that returns 0 on every real step at training time.
+    """
     from uuid import uuid4
     from robo_garden.rewards.reward_runner import compile_reward_function
     from robo_garden.rewards.models import RewardFunction
 
     task_description = input.get("task_description", "")
     reward_code = input.get("reward_code", "")
+    robot_name = (input.get("robot_name") or "").strip()
+
+    # Claude sometimes omits the optional robot_name — look up the latest
+    # approved design so the smoke test still uses real dimensions.
+    if not robot_name:
+        robot_name = _latest_approved_robot()
+
+    dims = _lookup_model_dims(robot_name) if robot_name else {}
+    obs_dim = dims.get("obs_dim")
+    action_dim = dims.get("action_dim")
 
     try:
-        compile_reward_function(reward_code)
+        compile_reward_function(reward_code, obs_dim=obs_dim, action_dim=action_dim)
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {
+            "success": False,
+            "error": str(e),
+            "resolved_robot_name": robot_name,
+            "obs_dim_used": obs_dim,
+            "action_dim_used": action_dim,
+            "hint": (
+                "obs = concat(qpos, qvel). "
+                f"For this robot: nq={dims.get('nq')}, nv={dims.get('nv')}, nu={dims.get('nu')}. "
+                "Every hard-coded index in compute_reward must be < obs_dim / nu."
+            ) if dims else (
+                "No approved robot found — approve_for_training must run first "
+                "so generate_reward can validate against real obs dimensions."
+            ),
+        }
 
     reward_id = f"reward_{uuid4().hex[:8]}"
     _reward_fns[reward_id] = RewardFunction(
@@ -344,6 +646,9 @@ def handle_generate_reward(input: dict) -> dict:
         "reward_function_id": reward_id,
         "task_description": task_description,
         "signature_valid": True,
+        "resolved_robot_name": robot_name,
+        "validated_obs_dim": obs_dim,
+        "validated_action_dim": action_dim,
     }
 
 
@@ -356,11 +661,15 @@ def handle_train(input: dict) -> dict:
     from robo_garden.isaac import get_bridge
 
     robot_name = input.get("robot_name", "")
-    robot_path = ROBOTS_DIR / f"{robot_name}.xml"
-    if not robot_path.exists():
-        robot_path = ROBOTS_DIR / f"{robot_name}.urdf"
-    if not robot_path.exists():
-        return {"success": False, "error": f"Robot '{robot_name}' not found. Call generate_robot first."}
+    # Check catalog path registry first
+    if robot_name in _catalog_paths:
+        robot_path = _catalog_paths[robot_name]
+    else:
+        robot_path = ROBOTS_DIR / f"{robot_name}.xml"
+        if not robot_path.exists():
+            robot_path = ROBOTS_DIR / f"{robot_name}.urdf"
+        if not robot_path.exists():
+            return {"success": False, "error": f"Robot '{robot_name}' not found. Call generate_robot first."}
 
     env_name = input.get("environment_name", "")
     env_mjcf = ""
@@ -371,12 +680,29 @@ def handle_train(input: dict) -> dict:
         else:
             log.warning(f"Environment '{env_name}' not found, training without environment MJCF")
 
+    reward_fn = None
     reward_fn_code = ""
     reward_id = input.get("reward_function_id", "")
     if reward_id:
         rf = get_reward_fn(reward_id)
         if rf:
             reward_fn_code = rf.code
+            try:
+                from robo_garden.rewards.reward_runner import (
+                    compile_reward_function,
+                    safe_reward,
+                )
+                _raw = compile_reward_function(reward_fn_code)
+                # safe_reward returns (float, dict) and converts IndexError /
+                # ValueError to (0.0, {"_error": ...}) so one bad index does
+                # not kill a long training run.
+                _safe = safe_reward(_raw, fallback=0.0)
+                reward_fn = (
+                    lambda obs, action, next_obs, _r=_safe:
+                        float(_r(obs, action, next_obs, {})[0])
+                )
+            except Exception as exc:
+                log.warning(f"Could not compile reward function '{reward_id}': {exc}")
         else:
             log.warning(f"Reward function '{reward_id}' not found, using default reward")
 
@@ -396,24 +722,300 @@ def handle_train(input: dict) -> dict:
     bridge = get_bridge()
     updates: list[dict] = []
 
+    import time as _time
+    from datetime import datetime, timezone
+    from uuid import uuid4
+    from robo_garden.training.history import append_run
+
+    run_id = f"run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:6]}"
+    started_at = _time.time()
+    best_so_far: dict = {"reward": float("-inf")}
+
+    bridge.send_train_run_start(
+        run_id=run_id,
+        robot_name=robot_name,
+        environment_name=env_name,
+        algorithm=config.algorithm,
+        total_timesteps=config.total_timesteps,
+        reward_function_id=reward_id,
+    )
+
     def _progress(timestep: int, metrics: dict) -> None:
         mean_reward = float(metrics.get("eval/episode_reward", 0))
+        if mean_reward > best_so_far["reward"]:
+            best_so_far["reward"] = mean_reward
+        elapsed = _time.time() - started_at
+        tps = (timestep / elapsed) if elapsed > 0 else 0.0
         updates.append({"timestep": timestep, "mean_reward": mean_reward})
-        bridge.send_training_update(robot_name, timestep, mean_reward)
+        bridge.send_training_update(
+            robot_name,
+            timestep,
+            mean_reward,
+            run_id=run_id,
+            best_reward=best_so_far["reward"],
+            elapsed_s=elapsed,
+            total_timesteps=config.total_timesteps,
+            algorithm=config.algorithm,
+            timesteps_per_second=tps,
+        )
+
+    robot_xml = robot_path.read_text(encoding="utf-8")
+    # Catalog robots have relative meshdir — rewrite to absolute so the engine
+    # can compile the XML from a string without needing the original file context.
+    if robot_name in _catalog_paths:
+        robot_xml = _absolutize_asset_paths(robot_xml, robot_path.parent)
+
+    # Pre-merge MJCF once for rollout sampling so we don't pay the cost on
+    # every rollout tick.  Best-effort — failures just disable rollouts.
+    try:
+        from robo_garden.training.mujoco_engine import _merge_mjcf
+        merged_for_rollout = _merge_mjcf(robot_xml, env_mjcf)
+    except Exception as exc:
+        log.warning(f"Could not merge MJCF for rollout streaming: {exc}")
+        merged_for_rollout = ""
+
+    def _rollout(timestep: int, policy_apply) -> None:
+        if not merged_for_rollout:
+            return
+        try:
+            from robo_garden.training.rollout import sample_rollout
+
+            rollout = sample_rollout(
+                merged_for_rollout,
+                policy_apply,
+                num_frames=150,
+                seed=int(timestep) & 0xFFFF,
+            )
+            if rollout.qpos.shape[0] > 0:
+                bridge.stream_qpos_batch(
+                    robot_name,
+                    rollout.qpos,
+                    list(rollout.timesteps),
+                )
+        except Exception as exc:
+            log.debug(f"rollout streaming failed at step {timestep}: {exc}")
 
     engine = MuJoCoMJXEngine()
-    engine.setup(robot_path.read_text(), env_mjcf, config, curriculum_config=curriculum_config)
-    result = engine.train(reward_fn_code=reward_fn_code, callback=_progress)
-    engine.cleanup()
+    engine.setup(robot_xml, env_mjcf, config, curriculum_config=curriculum_config)
+
+    error_text = ""
+    success = False
+    result = None
+    try:
+        result = engine.train(
+            reward_fn_code=reward_fn_code,
+            reward_fn=reward_fn,
+            callback=_progress,
+            rollout_callback=_rollout,
+        )
+        success = True
+    except Exception as exc:
+        error_text = f"{type(exc).__name__}: {exc}"
+        log.exception("Training failed")
+    finally:
+        engine.cleanup()
+
+    ended_at = _time.time()
+    training_time = ended_at - started_at
+    best_reward = float(result.best_reward) if result is not None else float("-inf")
+    checkpoint_path = str(result.checkpoint_path) if result is not None else ""
+    reward_curve = list(result.reward_curve) if result is not None else []
+
+    run_record = {
+        "run_id": run_id,
+        "robot_name": robot_name,
+        "environment_name": env_name,
+        "algorithm": config.algorithm,
+        "total_timesteps": config.total_timesteps,
+        "best_reward": best_reward,
+        "training_time_seconds": training_time,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "success": success,
+        "checkpoint_path": checkpoint_path,
+        "reward_function_id": reward_id,
+        "error": error_text,
+    }
+    append_run(run_record)
+
+    bridge.send_train_run_end(
+        run_id=run_id,
+        robot_name=robot_name,
+        success=success,
+        best_reward=best_reward if success else None,
+        training_time_seconds=training_time,
+        total_timesteps=config.total_timesteps,
+        checkpoint_path=checkpoint_path,
+        reward_curve=reward_curve[-50:],
+        error=error_text,
+    )
+
+    if not success:
+        return {
+            "success": False,
+            "error": error_text,
+            "run_id": run_id,
+            "training_time_seconds": training_time,
+            "isaac_connected": bridge.connected,
+        }
 
     return {
         "success": True,
+        "run_id": run_id,
         "robot_name": robot_name,
-        "best_reward": result.best_reward,
-        "training_time_seconds": result.training_time_seconds,
-        "reward_curve": result.reward_curve[-10:],
+        "best_reward": best_reward,
+        "training_time_seconds": training_time,
+        "reward_curve": reward_curve[-10:],
         "recent_updates": updates[-5:],
+        "checkpoint_path": checkpoint_path,
         "isaac_connected": bridge.connected,
+    }
+
+
+@register_handler("approve_for_training")
+def handle_approve_for_training(input: dict) -> dict:
+    """Promote a robot + environment pair from Design to Training phase.
+
+    Preconditions:
+      1. Robot file exists (saved via generate_robot or loaded from catalog).
+      2. Environment file exists (saved via generate_environment).
+      3. A recent `simulate` call stored a non-diverged SimulationResult for
+         the robot (indicating the passive physics is stable).
+
+    On success, writes ``workspace/approved/<robot>__<env>.json`` and fires
+    the registered approval callback so the Session flips to training phase.
+    """
+    import json
+    from datetime import datetime, timezone
+    from pathlib import Path
+    from robo_garden.config import ROBOTS_DIR, ENVIRONMENTS_DIR, APPROVED_DIR
+
+    robot_name = (input.get("robot_name") or "").strip()
+    env_name = (input.get("environment_name") or "").strip()
+    notes = input.get("notes", "")
+
+    missing: list[str] = []
+
+    if not robot_name:
+        missing.append("robot_name is required")
+    if not env_name:
+        missing.append("environment_name is required")
+
+    # Resolve robot path (catalog registry or saved file)
+    robot_path: Path | None = None
+    if robot_name:
+        if robot_name in _catalog_paths:
+            robot_path = _catalog_paths[robot_name]
+        else:
+            xml_path = ROBOTS_DIR / f"{robot_name}.xml"
+            urdf_path = ROBOTS_DIR / f"{robot_name}.urdf"
+            if xml_path.exists():
+                robot_path = xml_path
+            elif urdf_path.exists():
+                robot_path = urdf_path
+        if robot_path is None:
+            missing.append(
+                f"robot '{robot_name}' not found — call generate_robot first"
+            )
+
+    # Resolve environment path
+    env_path = ENVIRONMENTS_DIR / f"{env_name}.xml" if env_name else None
+    if env_path is not None and not env_path.exists():
+        missing.append(
+            f"environment '{env_name}' not found — call generate_environment first"
+        )
+
+    # Stability gate: most recent sim for this robot must be non-diverged
+    sim = _sim_results.get(robot_name)
+    if sim is None:
+        missing.append(
+            f"no recent simulate() result for '{robot_name}' — run a passive "
+            "simulation (control_mode='passive', duration_seconds>=1.0) first"
+        )
+    elif sim.diverged:
+        missing.append(
+            f"latest simulation for '{robot_name}' diverged — fix physics "
+            "instability before approving"
+        )
+
+    if missing:
+        return {
+            "success": False,
+            "approved": False,
+            "unmet_preconditions": missing,
+            "message": (
+                "Cannot approve — address the listed preconditions, then call "
+                "approve_for_training again."
+            ),
+        }
+
+    # Compute obs/action dims of the merged (robot + env) MJCF so later calls
+    # to generate_reward can validate shapes without re-loading MuJoCo. We
+    # tolerate failures here — worst case the reward smoke-test runs with a
+    # stand-in shape as before.
+    model_dims: dict = {}
+    try:
+        import mujoco
+        from robo_garden.training.mujoco_engine import _merge_mjcf
+
+        robot_xml_text = robot_path.read_text(encoding="utf-8")
+        if robot_name in _catalog_paths:
+            robot_xml_text = _absolutize_asset_paths(robot_xml_text, robot_path.parent)
+        env_xml_text = env_path.read_text(encoding="utf-8") if env_path is not None else ""
+        merged = _merge_mjcf(robot_xml_text, env_xml_text)
+        m = mujoco.MjModel.from_xml_string(merged)
+        model_dims = {
+            "nq": int(m.nq),
+            "nv": int(m.nv),
+            "nu": int(m.nu),
+            "obs_dim": int(m.nq + m.nv),
+            "action_dim": int(m.nu),
+            "floating_base": bool(m.nq > m.nv),
+        }
+    except Exception as exc:
+        log.warning(f"approve_for_training: could not compute model dims: {exc}")
+
+    manifest = {
+        "robot_name": robot_name,
+        "robot_path": str(robot_path),
+        "environment_name": env_name,
+        "environment_path": str(env_path),
+        "notes": notes,
+        "approved_at_utc": datetime.now(timezone.utc).isoformat(),
+        "sim_summary": dict(sim.summary) if sim is not None else {},
+        "sim_stable": bool(sim.stable) if sim is not None else False,
+        "model_dims": model_dims,
+    }
+    manifest_path = APPROVED_DIR / f"{robot_name}__{env_name}.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+
+    # Flip the session phase (no-op if no callback registered — e.g. in
+    # headless chat mode the user can still make progress, gating is still
+    # enforced at the tool-list level on the next turn).
+    if _on_approve is not None:
+        try:
+            _on_approve(robot_name, env_name, manifest_path)
+        except Exception as exc:
+            log.warning(f"approve_for_training callback failed: {exc}")
+
+    return {
+        "success": True,
+        "approved": True,
+        "robot_name": robot_name,
+        "environment_name": env_name,
+        "manifest_path": str(manifest_path),
+        "phase": "training",
+        "model_dims": model_dims,
+        "message": (
+            f"Design approved. Training tools (generate_reward, train) are now "
+            f"available. Manifest saved to {manifest_path.name}."
+            + (
+                f" Pass robot_name='{robot_name}' to generate_reward so the reward "
+                f"is smoke-tested against the real obs_dim={model_dims['obs_dim']} "
+                f"and action_dim={model_dims['action_dim']}."
+                if model_dims else ""
+            )
+        ),
     }
 
 

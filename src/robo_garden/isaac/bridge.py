@@ -1,10 +1,14 @@
-"""IsaacBridge: WebSocket client that streams robot/simulation state to Isaac Sim.
+"""IsaacBridge: bidirectional WebSocket client for the Studio UI.
 
 Design principles:
 - All public methods are safe to call when disconnected (return False / no-op).
 - Uses a background daemon thread + asyncio event loop so callers stay synchronous.
 - A threading.Event signals connection success/failure back to connect().
-- Queue is capped to 200 messages; overflow silently drops (display is best-effort).
+- Outbound queue is capped to 200 messages; overflow silently drops (display
+  is best-effort — dropping a frame is better than blocking physics).
+- Inbound messages (CHAT_MESSAGE, JOINT_TARGET, ...) are delivered by calling
+  the registered ``on_message`` callback ON THE ASYNC THREAD.  The callback
+  must be thread-safe or forward work to its own thread/queue.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ import logging
 import queue
 import threading
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -30,6 +35,7 @@ class IsaacBridge:
         self._send_queue: queue.Queue = queue.Queue(maxsize=200)
         self._thread: threading.Thread | None = None
         self._ready: threading.Event = threading.Event()
+        self._on_message: Callable[[dict], None] | None = None
 
     # ------------------------------------------------------------------
     # Connection management
@@ -61,14 +67,27 @@ class IsaacBridge:
     def connected(self) -> bool:
         return self._connected
 
+    def set_on_message(self, callback: Callable[[dict], None] | None) -> None:
+        """Register a callback fired for every inbound message from Isaac Sim.
+
+        The callback runs on the asyncio/bridge thread — keep it short and
+        thread-safe (ideally just dispatch to a queue).  Pass ``None`` to
+        clear.
+        """
+        self._on_message = callback
+
     # ------------------------------------------------------------------
-    # Public API (all no-ops when disconnected)
+    # Public send API (all no-ops when disconnected)
     # ------------------------------------------------------------------
 
     def send_robot(self, name: str, robot_path: Path, fmt: str = "mjcf") -> bool:
         """Tell Isaac Sim to import a robot from the shared workspace."""
         from robo_garden.isaac.protocol import make_load_robot
         return self._send(make_load_robot(name, robot_path, fmt=fmt))
+
+    def send_raw(self, msg: dict) -> bool:
+        """Send an already-constructed protocol message."""
+        return self._send(msg)
 
     def stream_simulation(
         self,
@@ -101,10 +120,78 @@ class IsaacBridge:
 
         self._send(make_sim_end(robot_name, result.stable, result.diverged, result.summary))
 
-    def send_training_update(self, robot_name: str, timestep: int, mean_reward: float, **kwargs) -> None:
+    def stream_qpos_batch(
+        self,
+        robot_name: str,
+        frames: np.ndarray,
+        timesteps: list[float],
+    ) -> None:
+        """Stream a batch of live qpos frames from InteractiveSim to Isaac Sim.
+
+        Unlike ``stream_simulation``, this is called continuously as the
+        background MuJoCo loop produces new state — no SIM_END at the end.
+        """
+        if not self._connected or frames.size == 0:
+            return
+        from robo_garden.isaac.protocol import make_sim_frame_batch
+        nq = frames.shape[1]
+        self._send(make_sim_frame_batch(robot_name, frames, timesteps, nq))
+
+    def send_training_update(
+        self,
+        robot_name: str,
+        timestep: int,
+        mean_reward: float,
+        **kwargs,
+    ) -> None:
         """Send a training progress update for the Isaac Sim overlay."""
         from robo_garden.isaac.protocol import make_train_update
         self._send(make_train_update(robot_name, timestep, mean_reward, **kwargs))
+
+    def send_train_run_start(
+        self,
+        run_id: str,
+        robot_name: str,
+        environment_name: str,
+        algorithm: str,
+        total_timesteps: int,
+        **kwargs,
+    ) -> None:
+        """Announce the start of a training run to the Studio UI."""
+        from robo_garden.isaac.protocol import make_train_run_start
+        self._send(
+            make_train_run_start(
+                run_id=run_id,
+                robot_name=robot_name,
+                environment_name=environment_name,
+                algorithm=algorithm,
+                total_timesteps=total_timesteps,
+                **kwargs,
+            )
+        )
+
+    def send_train_run_end(
+        self,
+        run_id: str,
+        robot_name: str,
+        success: bool,
+        **kwargs,
+    ) -> None:
+        """Announce completion (or failure) of a training run."""
+        from robo_garden.isaac.protocol import make_train_run_end
+        self._send(
+            make_train_run_end(
+                run_id=run_id,
+                robot_name=robot_name,
+                success=success,
+                **kwargs,
+            )
+        )
+
+    def send_train_history(self, runs: list[dict]) -> None:
+        """Seed the Studio's run history list with recent runs on connect."""
+        from robo_garden.isaac.protocol import make_train_history
+        self._send(make_train_history(runs))
 
     # ------------------------------------------------------------------
     # Internal
@@ -133,19 +220,43 @@ class IsaacBridge:
                 self._ready.set()
                 log.info(f"Isaac bridge connected to {self._url}")
 
-                while True:
-                    try:
-                        msg = self._send_queue.get_nowait()
-                    except queue.Empty:
-                        await asyncio.sleep(0.005)
-                        continue
-
-                    if msg is _STOP:
-                        break
-                    await ws.send(msg)
+                # Run sender + receiver concurrently
+                sender = asyncio.create_task(self._sender(ws))
+                receiver = asyncio.create_task(self._receiver(ws))
+                done, pending = await asyncio.wait(
+                    {sender, receiver}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
 
         except Exception as e:
             log.debug(f"Isaac bridge: {e}")
         finally:
             self._connected = False
             self._ready.set()  # unblock connect() on failure
+
+    async def _sender(self, ws) -> None:
+        while True:
+            try:
+                msg = self._send_queue.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.005)
+                continue
+
+            if msg is _STOP:
+                break
+            await ws.send(msg)
+
+    async def _receiver(self, ws) -> None:
+        """Forward inbound messages to the registered on_message callback."""
+        async for raw in ws:
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                log.warning(f"Bridge: invalid JSON inbound: {raw[:80]}")
+                continue
+            if self._on_message is not None:
+                try:
+                    self._on_message(msg)
+                except Exception as exc:
+                    log.warning(f"Bridge on_message callback failed: {exc}")

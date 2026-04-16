@@ -11,6 +11,7 @@ import anthropic
 
 from robo_garden.claude.tools import TOOLS
 from robo_garden.claude.tool_handlers import dispatch_tool
+from robo_garden.claude.gating import tools_for_phase
 from robo_garden.config import ANTHROPIC_API_KEY, CLAUDE_MODEL
 
 log = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ _TOOL_LABELS: dict[str, str] = {
     "generate_reward": "Writing reward function",
     "train": "Training",
     "query_catalog": "Searching catalog",
+    "approve_for_training": "Approving design",
 }
 
 
@@ -66,6 +68,14 @@ def _tool_result_summary(name: str, result: dict) -> str:
     if name == "evaluate":
         metrics = result.get("metrics", {})
         return ", ".join(f"{k}={v:.3f}" for k, v in list(metrics.items())[:3]) or "done"
+    if name == "approve_for_training":
+        if result.get("approved"):
+            return (
+                f"{result.get('robot_name', '?')} + {result.get('environment_name', '?')} "
+                "→ training unlocked"
+            )
+        unmet = result.get("unmet_preconditions", [])
+        return f"not approved — {len(unmet)} precondition(s) unmet"
     return "done"
 
 
@@ -106,6 +116,7 @@ def run_agentic_loop(
     on_status: Callable[[str], None] | None = None,
     on_tool_call: Callable[[str, dict], None] | None = None,
     on_tool_result: Callable[[str, dict], None] | None = None,
+    phase_getter: Callable[[], str] | None = None,
 ) -> tuple[str, list[dict]]:
     """Run the Claude tool-use agentic loop until Claude returns a final text response.
 
@@ -120,6 +131,10 @@ def run_agentic_loop(
             (tool_name, tool_input).
         on_tool_result: Optional callback fired after each tool dispatch with
             (tool_name, result_dict).
+        phase_getter: Optional callable returning the current session phase
+            ("design" or "training").  Re-evaluated on each iteration so that a
+            successful ``approve_for_training`` call mid-turn unlocks training
+            tools on the very next iteration.  Defaults to "design".
 
     Returns:
         Tuple of (final_text_response, updated_messages).
@@ -130,13 +145,15 @@ def run_agentic_loop(
 
     for iteration in range(max_iterations):
         _status("Thinking...")
+        current_phase = phase_getter() if phase_getter else "design"
+        allowed_tools = tools_for_phase(current_phase, TOOLS)
         response = _create_with_retry(
             client,
             on_status=on_status,
             model=CLAUDE_MODEL,
             system=system_prompt,
             messages=messages,
-            tools=TOOLS,
+            tools=allowed_tools,
             max_tokens=16384,
         )
 

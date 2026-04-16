@@ -51,9 +51,11 @@ class MJXVectorizedEnv:
         self._nq = self._mj_model.nq
         self._nv = self._mj_model.nv
         self._nu = self._mj_model.nu
-        # Floating-base robots have nq > nv (quaternion adds one extra DOF)
+        # Canonical obs layout: concat(qpos, qvel). This matches MuJoCoGymEnv
+        # (used by SB3) and the smoke test in rewards/reward_runner.py, so
+        # Claude-written reward functions see the same shape across every path.
         self._floating_base = self._mj_model.nq > self._mj_model.nv
-        self._obs_dim = (self._nq - (1 if self._floating_base else 0)) + self._nv + self._nu
+        self._obs_dim = self._nq + self._nv
 
         try:
             import jax
@@ -152,10 +154,10 @@ class MJXVectorizedEnv:
 
         # Default reward: penalise control effort; forward if obs has velocity
         if self.reward_fn is not None:
-            rewards = np.array([
-                self.reward_fn(prev_obs[i], actions[i], obs[i])
-                for i in range(self.num_envs)
-            ], dtype=np.float32)
+            def _r(i):
+                raw = self.reward_fn(prev_obs[i], actions[i], obs[i])
+                return float(raw[0]) if isinstance(raw, tuple) else float(raw)
+            rewards = np.array([_r(i) for i in range(self.num_envs)], dtype=np.float32)
         else:
             ctrl_cost = 0.1 * np.sum(actions ** 2, axis=-1)
             rewards = -ctrl_cost
@@ -178,19 +180,11 @@ class MJXVectorizedEnv:
 
     def _extract_obs_mjx(self, batch_data) -> np.ndarray:
         jnp = self._jnp
-        qpos = batch_data.qpos
-        qvel = batch_data.qvel
-        ctrl = batch_data.ctrl
-        if self._floating_base:
-            qpos = qpos[:, 1:]  # drop root x translation for translation-invariance
-        obs = jnp.concatenate([qpos, qvel, ctrl], axis=-1)
+        obs = jnp.concatenate([batch_data.qpos, batch_data.qvel], axis=-1)
         return np.array(obs, dtype=np.float32)
 
     def _extract_obs_cpu(self) -> np.ndarray:
-        obs = []
-        for d in self._cpu_datas:
-            qpos = d.qpos[1:] if self._floating_base else d.qpos
-            obs.append(np.concatenate([qpos, d.qvel, d.ctrl]))
+        obs = [np.concatenate([d.qpos, d.qvel]) for d in self._cpu_datas]
         return np.array(obs, dtype=np.float32)
 
     def _partial_reset(self, mask: np.ndarray) -> tuple[np.ndarray, dict]:

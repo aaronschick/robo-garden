@@ -44,6 +44,12 @@ RENDERS_DIR.mkdir(exist_ok=True)
 PROMPTS_DIR = WORKSPACE_DIR / "prompts"
 PROMPTS_DIR.mkdir(exist_ok=True)
 
+APPROVED_DIR = WORKSPACE_DIR / "approved"
+APPROVED_DIR.mkdir(exist_ok=True)
+
+RUNS_DIR = WORKSPACE_DIR / "runs"
+RUNS_DIR.mkdir(exist_ok=True)
+
 DATA_DIR = Path(__file__).parent / "data"
 
 # API configuration

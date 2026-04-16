@@ -1,0 +1,56 @@
+We have completed the initial design review of the Go2 walker. Here are the approved decisions —
+proceed directly without asking for further confirmation on these points:
+
+APPROVED DECISIONS:
+1. Joint damping: keep the MuJoCo Menagerie defaults for this first training run.
+   We will revisit knee damping after seeing the initial gait quality.
+2. Environment: flat ground only, default friction (mu ~0.8). No terrain variation yet.
+3. Reward structure: use the proposal from the design review with these exact weights:
+   - R_forward   = clip(vx, 0, 4.0)              weight 2.0   (forward CoM velocity)
+   - R_height     = exp(-10 * (z - 0.41)^2)       weight 1.0   (penalise CoM height deviation from 0.41m)
+   - R_smooth     = -mean(|joint_accel|)           weight 0.5   (penalise jerky motion)
+   - R_energy     = -mean(|ctrl * qvel_actuated|)  weight 0.1   (penalise electrical power)
+   - R_termination = -100 if z < 0.15             weight 1.0   (collapse penalty, end episode)
+   Total: R = 2.0*R_forward + 1.0*R_height + 0.5*R_smooth - 0.1*R_energy - 100*(z < 0.15)
+
+   The observation vector passed to compute_reward is: [qpos (19,), qvel (18,)] = 37 elements.
+   - qpos[0:3] = root position (x, y, z)
+   - qpos[3:7] = root quaternion (w, x, y, z)
+   - qpos[7:19] = 12 joint angles
+   - qvel[0:3] = root linear velocity (vx, vy, vz)
+   - qvel[3:6] = root angular velocity
+   - qvel[6:18] = 12 joint velocities
+   In compute_reward, next_obs gives the state after the step was applied.
+
+TASKS — execute in order:
+
+1. GENERATE REWARD
+   Call generate_reward with the task_description and the complete Python compute_reward
+   function implementing the reward structure above.
+
+2. GENERATE ENVIRONMENT
+   Call generate_environment to create a flat ground environment named "flat_ground".
+   The MJCF should include: a flat plane geom, neutral grey colour, friction 1.0 0.005 0.0001,
+   a top-down light, and optionally a subtle ground texture. Size 50x50 metres.
+   Do NOT include the robot — the engine merges them.
+
+3. PILOT TRAINING RUN
+   Call train with:
+   - robot_name: "go2_walker"
+   - environment_name: "flat_ground"
+   - total_timesteps: 200000
+   - num_envs: 64
+   - algorithm: "ppo"
+   Report the best_reward and reward_curve from the result. If best_reward is still
+   near zero or negative after 200k steps, diagnose whether the reward function
+   is the issue (scale too small? termination too aggressive?) and suggest one
+   targeted adjustment.
+
+4. EVALUATE AND REPORT
+   After training completes, report:
+   - Best reward achieved and at which timestep
+   - Whether the reward curve shows an upward trend (learning signal present)
+   - Your assessment of whether the reward weights need rebalancing before a full run
+   - Recommended next action: full 1M-step run, reward adjustment, or damping change
+
+Do NOT start a second training run in this session — wait for my review of the pilot results.

@@ -1,0 +1,161 @@
+ROBOT SPECIFICATION: HYBRID RADIAL-ACTUATOR SPHERICAL ROBOT
+Codename: "Urchin"
+
+========================================
+OVERALL FORM FACTOR
+========================================
+
+- Shape: Hollow sphere
+- Outer radius: 150mm (300mm diameter)
+- Shell thickness: 5mm
+- Total mass: 2.0kg
+- Shell material properties: rigid, moderate friction (μ ≈ 0.6 with ground)
+- No wheels, no legs, no external appendages — locomotion is entirely through radial actuators extending from the shell surface
+
+========================================
+ACTUATOR LAYOUT
+========================================
+
+42 prismatic actuators total, all oriented radially (pointing outward from sphere center), arranged on an icosahedral geodesic pattern (subdivision frequency 1 — an icosahedron with midpoint-subdivided faces yields 42 vertices evenly distributed on a sphere).
+
+Each actuator:
+- Base mounted flush with the inner shell surface
+- Extends a small "foot" (cylindrical tip, 10mm diameter, 5mm thick, ~10g) outward through a hole in the shell
+- Foot is the only part that contacts the ground
+- Resting position: foot flush with or slightly recessed from shell surface
+- Extension direction: purely radial (along the vector from sphere center through the mount point)
+
+SPLIT BY TYPE:
+
+Type A — Voice Coil Actuators (30 units)
+- Positioned on the 30 "edge midpoint" vertices of the subdivided icosahedron (mid-latitude positions relative to any given pole orientation)
+- Stroke: 0 to 15mm extension
+- Continuous force: 5N
+- Peak force: 12N
+- Effective mass (moving mass of coil + foot): 25g
+- Control: continuous/proportional force command, normalized [-1, +1] mapped to [-12N, +12N]
+- Response: treat as near-instant (sub-millisecond), no significant actuator lag
+- Damping: light internal damping, backdrivable
+- Intended use: primary locomotion, fine balance, proportional traveling-wave rolling
+
+Type B — Solenoid Actuators (12 units)
+- Positioned on the 12 original icosahedron vertices (the "pentagonal" nodes, most spread out)
+- Stroke: 0 to 20mm extension
+- Force: 25N (treat as approximately constant when firing)
+- Effective mass: 40g
+- Control: binary on/off command; when "on," actuator commands full extension; when "off," retracts via spring return
+- Response: 10ms extension, 15ms retraction (first-order lag acceptable)
+- Duty cycle limit: no individual solenoid should be commanded "on" for more than 100ms at a time, and not more than 10% average duty cycle (enforce in simulation as a soft penalty or hard limit)
+- Intended use: impulsive kicks for obstacles, rapid acceleration, emergency corrections
+
+========================================
+INTERNAL MASS DISTRIBUTION
+========================================
+
+The sphere is NOT uniformly dense. Internal components create an intentionally asymmetric mass distribution:
+
+- Battery pack: 400g, modeled as a 60mm × 40mm × 20mm block, offset 40mm from sphere center along one axis (call it the -Z internal axis)
+- Electronics package: 200g, modeled as a 50mm × 50mm × 15mm block, adjacent to battery
+- Shell + actuator hardware: remaining ~1.4kg distributed across the shell and 42 actuator bases
+- Net effect: center of mass is offset approximately 15-20mm from geometric center along the -Z internal axis
+- This asymmetry is a FEATURE, not a bug — the policy should learn to exploit gravitational bias from the offset CoM
+
+========================================
+SENSORS
+========================================
+
+1. IMU at sphere geometric center
+   - 3-axis orientation (quaternion)
+   - 3-axis angular velocity
+   - 3-axis linear acceleration
+   - Update rate: 200Hz
+   - Use Isaac Lab's native IMU sensor
+
+2. Per-actuator state (available as joint state from articulation):
+   - Position (current extension, 0-15mm or 0-20mm)
+   - Velocity
+   - Applied force/effort
+
+3. Contact sensors on each of the 42 feet
+   - Binary or force-magnitude contact detection
+   - Use Isaac Lab's ContactSensor on each foot body
+
+4. Base body state (for training/reward purposes only, not "real" sensor):
+   - World position
+   - World linear velocity
+   - World angular velocity
+
+========================================
+ACTION SPACE
+========================================
+
+Total dimensionality: 42
+
+- Actions 0-29: continuous, range [-1, +1], mapped to voice coil force commands
+- Actions 30-41: continuous, range [0, +1], thresholded at 0.5 for binary solenoid firing (alternatively expose as discrete, policy-designer's choice)
+
+========================================
+OBSERVATION SPACE (suggested baseline)
+========================================
+
+- IMU orientation (4) + angular velocity (3) + linear acceleration (3) = 10
+- Actuator positions (42) + velocities (42) = 84
+- Contact sensor readings (42) = 42
+- Commanded velocity target (3) = 3 (for velocity-tracking tasks)
+- Previous action (42) = 42 (for action smoothness)
+
+Total baseline observation: 181 dimensions. Trim as needed.
+
+========================================
+JOINT / ARTICULATION STRUCTURE
+========================================
+
+- Root body: sphere shell (with internal mass geometry attached as fixed child links to represent battery + electronics)
+- 42 child bodies: one foot per actuator
+- 42 prismatic joints: each connects a foot to the shell, axis aligned with the radial outward direction from sphere center through the mount point
+- Joint limits: [0, 0.015] meters for voice coil joints, [0, 0.020] meters for solenoid joints
+- Joint damping: low for voice coils (backdrivable), higher for solenoids (spring return modeled as stiffness + damping)
+
+========================================
+ACTUATOR GROUP CONFIGURATION
+========================================
+
+Two actuator groups in the ArticulationCfg:
+
+Group "voice_coils":
+- 30 joints (names: vc_00 through vc_29)
+- Actuator model: DCMotorCfg or IdealPDActuatorCfg with effort_limit=12.0, velocity_limit=high (e.g., 2.0 m/s), stiffness=0.0, damping=low
+- Control mode: effort/force
+
+Group "solenoids":
+- 12 joints (names: sol_00 through sol_11)
+- Actuator model: ImplicitActuatorCfg with high stiffness (e.g., 5000) and damping (e.g., 50), effort_limit=25.0
+- Control mode: position target (commanded to either 0.0 or 0.020 based on binary action)
+- Alternative: model as a force-based actuator with a first-order filter on the input to simulate 10ms activation lag
+
+========================================
+ENVIRONMENT / GROUND
+========================================
+
+- Flat ground plane for Phase 1
+- Friction: μ=0.6 with shell feet
+- Restitution: low (0.1) — feet don't bounce meaningfully
+- Phase 2: procedural terrain with bumps, ramps, steps, gaps — use Isaac Lab's terrain generator
+
+========================================
+WHAT TO BUILD
+========================================
+
+1. The USD articulation file for the robot described above
+2. The ArticulationCfg Python object with both actuator groups correctly configured
+3. A minimal DirectRLEnv or ManagerBasedRLEnv scaffold for a "flat-ground forward rolling" task
+4. A reward function draft including:
+   - Forward velocity tracking (primary)
+   - Upright/stability term (penalize excessive angular velocity except about the rolling axis)
+   - Energy/effort penalty (per-actuator, weighted higher for solenoids)
+   - Solenoid duty-cycle penalty (discourage overuse)
+   - Action smoothness penalty (discourage high-frequency chatter on voice coils)
+5. Observation and action space definitions matching the spec above
+6. Any recommended domain randomization for sim-to-real robustness
+
+Start with the USD / articulation structure and the ActuatorGroup configs. Flag any parameters above that you think are physically unrealistic or that will cause simulation instability before you build.
