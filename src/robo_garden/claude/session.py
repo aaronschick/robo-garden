@@ -54,7 +54,12 @@ class Session:
     pre-approved manifest.
     """
 
-    def __init__(self, phase: str = "design", enable_viewer: bool = True) -> None:
+    def __init__(
+        self,
+        phase: str = "design",
+        enable_viewer: bool = True,
+        extra_context: str = "",
+    ) -> None:
         self.session_id = str(uuid.uuid4())[:8]
         self.messages: list[dict] = []
         self.client = create_client()
@@ -63,6 +68,7 @@ class Session:
         self.approved_robot: str | None = None
         self.approved_environment: str | None = None
         self.approved_manifest: Path | None = None
+        self._extra_context: str = extra_context
 
         # Register ourselves as the approval sink so `approve_for_training`
         # flips phase automatically when Claude (or the UI) invokes it.
@@ -89,9 +95,14 @@ class Session:
     ) -> str:
         """Send a message and get Claude's response, handling tool calls automatically."""
         self.messages.append({"role": "user", "content": user_message})
+        system_prompt = (
+            SYSTEM_PROMPT + "\n\n" + self._extra_context
+            if self._extra_context
+            else SYSTEM_PROMPT
+        )
         response, self.messages = run_agentic_loop(
             client=self.client,
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             messages=self.messages,
             on_status=on_status,
             on_tool_call=on_tool_call,

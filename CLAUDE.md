@@ -94,6 +94,115 @@ uv run robo-garden --mode tui
 uv run pytest tests/ -x
 ```
 
+## GPU Training (WSL2)
+
+Windows cannot run the JAX/MJX/Brax GPU physics path — Google does not ship
+CUDA JAX wheels for Windows. The fix is to run the training backend inside
+WSL2, which accesses your NVIDIA GPU through the Windows driver. Isaac Sim,
+the Claude design loop, and the CLI all stay on Windows.
+
+**One-time setup** (from a Windows PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_wsl2.ps1
+```
+
+The script will:
+1. Verify `wsl.exe` is present (install via `wsl --install` from an elevated
+   PowerShell if not).
+2. Offer to install `Ubuntu-22.04` if no distro exists. You finish the Ubuntu
+   first-run setup (pick a username + password), then re-run the script.
+3. Preflight-check that bash actually executes inside the distro (a fresh
+   distro can sometimes silently no-op until first-run setup completes).
+4. Offer to set `Ubuntu-22.04` as the default WSL distro. **Important** if
+   you also have Docker Desktop installed: its bundled `docker-desktop`
+   distro is Alpine-based and has no `bash`, so leaving it as default
+   breaks `wsl bash -c "..."`-style invocations.
+5. Invoke `scripts/setup_wsl2.sh` inside the distro, which:
+   - Installs `uv`, then `uv sync --upgrade --python 3.12`
+   - Verifies the install with a sentinel string check (catches the silent
+     `wsl.exe` exits-zero-with-no-output failure mode)
+   - Verifies JAX sees the GPU
+   - Optionally runs a Brax PPO smoke test on cartpole
+
+Pass `-SkipSmokeTest` to skip the final Brax run (faster).
+Pass `-Distro <name>` to target a different distro than `Ubuntu-22.04`.
+
+**Where the WSL venv lives.** It is intentionally **not** at
+`./.venv` (which is the Windows venv). Both Windows and WSL share the
+project dir through `/mnt/c`, so a single `.venv` would cause Windows `uv`
+to choke on Linux symlinks (`.venv/lib64`). Instead the WSL venv goes to
+`$HOME/.cache/robo-garden/venv` on the Linux ext4 filesystem — both for
+collision-avoidance and for ~5x faster site-packages reads vs NTFS-via-9P.
+Override via `UV_PROJECT_ENVIRONMENT` if you need a different location.
+
+**Headless GPU training runs** (from Windows PowerShell):
+
+```powershell
+uv run robo-garden --mode train --wsl --robot cartpole --timesteps 1000000 --envs 128
+uv run robo-garden --mode train --wsl --robot go2_walker --timesteps 5000000 --envs 128
+```
+
+The `--wsl` flag translates the Windows project path to `/mnt/c/...`,
+explicitly targets `Ubuntu-22.04` (override with `$env:ROBO_GARDEN_WSL_DISTRO`),
+points uv at the ext4 venv via `UV_PROJECT_ENVIRONMENT`, then invokes the
+trainer inside WSL and streams stdout back to the Windows terminal. If you
+see `Algorithm: Brax PPO (GPU/JAX)` in the live panel, the GPU path is
+working. If you see `Algorithm: Random rollout (no learning)`, something
+upstream fell back — re-run setup or check the WSL torch/jax versions.
+
+**Version pin notes** (don't edit `pyproject.toml` blindly here):
+- `requires-python = ">=3.11,<3.13"` — `mujoco` 3.7 ships no wheel for
+  cpython 3.14, and uv otherwise grabs the newest available, breaking the
+  build with `MUJOCO_PATH not set`.
+- `jax[cuda12]<0.9` — JAX 0.9 removed `jax.device_put_replicated` (which
+  was deprecated in 0.8.1 in Nov 2025). Brax 0.14.x still calls it during
+  PPO training, so we cap jax at the 0.8.x line until brax ships a fix.
+- `torch>=2.3` is intentionally **not** capped on Linux even though torch
+  2.10/2.11 wheels have an NCCL ABI mismatch (`undefined symbol:
+  ncclDevCommDestroy`). The WSL training path uses Brax (JAX), not SB3
+  (torch), so the broken torch is fine — and capping it forces JAX's
+  cuDNN to an older minor version that JAX 0.8 then refuses to load.
+
+**Claude-driven training in `--mode gym` on GPU.** Set
+`ROBO_GARDEN_TRAIN_IN_WSL=1` before launching the gym session:
+
+```powershell
+$env:ROBO_GARDEN_TRAIN_IN_WSL="1"
+uv run robo-garden --mode gym --approved go2_walker__flat_ground
+```
+
+When Claude calls the `train` tool, `handle_train` stages the job (robot
+XML, environment MJCF, reward source code, hyperparameters) into
+`workspace/_wsl_jobs/<run_id>/job.json`, subprocess-launches
+`wsl.exe -d Ubuntu-22.04 -- uv run robo-garden --mode train --wsl-worker <job_dir>`,
+and streams progress back over stdout (JSONL lines prefixed with
+`__RG_PROGRESS__`) which it forwards verbatim to the Isaac Sim training
+panel and run history. The worker writes `result.json` on exit; the
+Windows side parses it and returns the normal tool-result dict to Claude.
+
+The reward function's source is compiled **twice** inside the WSL worker:
+1. As a normal NumPy callable (used by the SB3 / CPU fallback path).
+2. As a JAX-traceable callable (used by Brax PPO / CUDA path), by
+   re-exec'ing the code with `np`/`numpy` rebound to `jax.numpy` and
+   `float`/`int`/`bool` rebound to tracer-safe pass-throughs.
+
+If the JAX compile succeeds, training uses the Brax + MJX GPU path
+(~20–50× faster). If it fails (e.g. Python `if` on obs values), the
+worker falls back to SB3 with a clear note on stdout explaining the
+fix. Most rewards Claude writes — arithmetic, `np.clip`, `np.exp`,
+`np.mean`, `np.abs`, `np.where` — trace cleanly.
+
+**Caveats for gym-mode-in-WSL:**
+- Live policy rollouts into the Isaac viewport are disabled on this path
+  (the trained policy params live in the WSL subprocess; marshaling them
+  back each tick isn't wired yet). Run-progress metrics still flow.
+- Override the distro with `$env:ROBO_GARDEN_WSL_DISTRO`.
+- The staged job dir is preserved on failure — inspect
+  `workspace/_wsl_jobs/<run_id>/` and re-run
+  `uv run robo-garden --mode train --wsl-worker <job_dir>` from a WSL
+  shell to get the full traceback.
+
 ## Dependencies
 
 - `mujoco` + `mujoco-mjx` — physics simulation

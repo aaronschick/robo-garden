@@ -24,9 +24,16 @@
 set -euo pipefail
 BOLD='\033[1m'; CYAN='\033[36m'; GREEN='\033[32m'; RED='\033[31m'; RESET='\033[0m'
 
+# When invoked from setup_wsl2.ps1 the parent PowerShell pipes our stdout
+# line-by-line. Force unbuffered python output and UTF-8 encoding so progress
+# shows up in the Windows console without getting stuck in a buffer or mangled
+# by the default Windows codepage.
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+
 log()  { echo -e "${CYAN}==>${RESET} ${BOLD}$*${RESET}"; }
-ok()   { echo -e "${GREEN}✓${RESET}  $*"; }
-fail() { echo -e "${RED}✗${RESET}  $*" >&2; exit 1; }
+ok()   { echo -e "${GREEN}[OK]${RESET}  $*"; }
+fail() { echo -e "${RED}[FAIL]${RESET}  $*" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -51,12 +58,27 @@ fi
 # ---------------------------------------------------------------------------
 log "Checking NVIDIA GPU"
 if ! command -v nvidia-smi &>/dev/null; then
-    fail "nvidia-smi not found.
-    WSL2 requires the Windows NVIDIA driver (>=470) — no separate Linux driver needed.
-    See: https://docs.nvidia.com/cuda/wsl-user-guide/
-    Install/update your Windows NVIDIA driver then restart WSL2."
+    fail "nvidia-smi not found inside WSL2.
+
+WSL2 gets its GPU access through the Windows NVIDIA driver (no separate Linux
+driver needed). If nvidia-smi is missing, usually one of these is true:
+
+  1. Your Windows NVIDIA driver is older than 470. Upgrade at nvidia.com.
+  2. You installed 'nvidia-cuda-toolkit' via apt — don't. The WSL2 workflow
+     ships drivers from Windows; apt's toolkit shadows them. Remove with:
+        sudo apt remove --purge nvidia-cuda-toolkit
+  3. WSL2 needs a restart after a fresh Windows driver install. From Windows:
+        wsl --shutdown
+     Then re-run this script.
+
+Docs: https://docs.nvidia.com/cuda/wsl-user-guide/"
 fi
-GPU_INFO=$(nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader)
+if ! GPU_INFO=$(nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>&1); then
+    fail "nvidia-smi is installed but failed to run:
+${GPU_INFO}
+
+Try 'wsl --shutdown' from Windows then re-run this script."
+fi
 ok "GPU detected: $GPU_INFO"
 
 # ---------------------------------------------------------------------------
@@ -76,9 +98,29 @@ fi
 # ---------------------------------------------------------------------------
 # 4. Install Python dependencies
 # ---------------------------------------------------------------------------
+# Put the venv on the ext4 filesystem ($HOME), not /mnt/c, for two reasons:
+#   1. Windows and WSL share the project dir via /mnt/c, so a single .venv
+#      there would collide between the two platforms (Windows uv tries to
+#      rebuild it and fails on Linux symlinks like .venv/lib64).
+#   2. ext4 is dramatically faster than NTFS-through-9P for site-packages
+#      reads. Cuts `uv sync` install time from ~10 min to under 2 min on a
+#      warm cache.
+#
+# We pin Python 3.12 explicitly because mujoco 3.7 has no wheels for 3.14;
+# without the pin uv grabs 3.14 (newest), tries to build mujoco from source,
+# and fails on MUJOCO_PATH. The Windows side also runs 3.12, keeping parity.
+export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$HOME/.cache/robo-garden/venv}"
+mkdir -p "$(dirname "$UV_PROJECT_ENVIRONMENT")"
+
 log "Installing Python dependencies (jax[cuda12], mujoco-mjx, brax, ...)"
+log "Venv location: $UV_PROJECT_ENVIRONMENT"
 cd "$PROJECT_DIR"
-uv sync
+# --upgrade forces re-resolution against the current pyproject so that
+# transitive CUDA libs (notably nvidia-cudnn-cu12) match what the
+# currently-resolved jax expects. Without this, an older lockfile from a
+# previous failed run can leave cuDNN one minor version behind what
+# `jax[cuda12]` needs at runtime, producing "RuntimeError: cuDNN not found."
+uv sync --python 3.12 --upgrade
 ok "uv sync complete"
 
 # ---------------------------------------------------------------------------
@@ -120,6 +162,13 @@ fi
 # ---------------------------------------------------------------------------
 # 6. Smoke test — short Brax PPO run
 # ---------------------------------------------------------------------------
+if [[ "${ROBO_GARDEN_SKIP_SMOKE:-0}" == "1" ]]; then
+    ok "Skipping Brax PPO smoke test (ROBO_GARDEN_SKIP_SMOKE=1)"
+    echo ""
+    echo -e "${GREEN}${BOLD}Setup complete (smoke test skipped).${RESET}"
+    exit 0
+fi
+
 log "Running Brax PPO smoke test (4096 timesteps)"
 uv run python - <<'PYEOF'
 import sys

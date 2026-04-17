@@ -77,6 +77,13 @@ _STUDIO_UI_TYPES = {
     "TRAIN_UPDATE",
     "TRAIN_RUN_END",
     "TRAIN_HISTORY",
+    "TRAIN_ROLLOUT_PREVIEW",
+    "TRAIN_REWARD_BREAKDOWN",
+    "MODE_CHANGED",
+    "SKILL_LIST",
+    "POLICY_LIST",
+    "POLICY_PLAYBACK_STATUS",
+    "GAMEPAD_INPUT",
 }
 
 # Callback set by the Studio UI extension, if loaded.  Signature: (msg: dict).
@@ -351,6 +358,29 @@ def _maybe_setattr(obj, attr: str, value) -> bool:
         return False
 
 
+def _clear_robot_prim_if_present(name: str) -> None:
+    """Delete ``/World/{name}`` when present.
+
+    Failed MJCF imports often leave a partial prim tree; a retry without
+    deleting first triggers duplicate-path USD errors (e.g. duplicate
+    ``.../base/base`` on ``isaac:physics:robotLinks``).
+    """
+    try:
+        stage = omni.usd.get_context().get_stage()
+        if not stage:
+            return
+        ppath = f"/World/{name}"
+        prim = stage.GetPrimAtPath(ppath)
+        if prim:
+            omni.kit.commands.execute("DeletePrims", paths=[ppath])
+    except Exception as exc:
+        log.debug(f"_clear_robot_prim_if_present({name!r}): {exc}")
+    try:
+        world.step(render=False)
+    except Exception:
+        pass
+
+
 def _list_world_children() -> list[str]:
     """Return the immediate child prim paths under ``/World`` for debugging."""
     try:
@@ -431,6 +461,8 @@ def _handle_load_robot(msg: dict) -> None:
     # (see make_load_robot) but belt-and-braces in case an older client is
     # talking to us.
     path = path.replace("\\", "/")
+    # Populated when we build a material-inlined temp MJCF for Isaac 5.1 import.
+    compat_mjcf_tmp = None
 
     # Idempotency: drop a LOAD_ROBOT that exactly matches what's already in the
     # stage.  Claude frequently calls generate_robot twice in quick succession
@@ -533,33 +565,58 @@ def _handle_load_robot(msg: dict) -> None:
             # <material> elements are copied — and the importer then bails out
             # with an empty return path.  Writing to a temp USD first and
             # letting the main stage reference it sidesteps the buggy copy.
+            #
+            # If both attempts still fail (e.g. Menagerie go2.xml), we write a
+            # material-inlined MJCF next to the source so meshdir still
+            # resolves, then retry — see mjcf_isaac_compat.py.
+            import sys
             import tempfile
             from pathlib import Path as _P
+
+            _srv_dir = str(_P(__file__).resolve().parent)
+            if _srv_dir not in sys.path:
+                sys.path.insert(0, _srv_dir)
+            from mjcf_isaac_compat import write_isaac_viewport_mjcf_beside_source
 
             tmp_dir = _P(tempfile.gettempdir()) / "robo_garden_mjcf"
             tmp_dir.mkdir(parents=True, exist_ok=True)
             dest_path = (tmp_dir / f"{name}.usd").as_posix()
 
+            def _mjcf_try(mjcf_path: str, dpath: str) -> str:
+                _clear_robot_prim_if_present(name)
+                try:
+                    return mjcf_importer.create_asset_mjcf(
+                        mjcf_path, prim_path, config, dpath
+                    ) or ""
+                except Exception as exc:
+                    log.warning(
+                        f"MJCF import failed ({mjcf_path!r}, dest={dpath!r}): {exc!r}"
+                    )
+                    return ""
+
             created_path = ""
-            try:
-                created_path = mjcf_importer.create_asset_mjcf(
-                    path, prim_path, config, dest_path
-                )
-            except Exception as exc:
-                log.warning(
-                    f"MJCF import via temp USD failed ({exc!r}); retrying in-memory"
-                )
+            for dpath in (dest_path, ""):
+                created_path = _mjcf_try(path, dpath)
+                if created_path:
+                    break
 
             if not created_path:
-                # Fallback to the original in-memory behavior.  Kept because
-                # some Kit builds reject file writes under %TEMP% (sandboxing).
-                log.info("MJCF temp-USD import returned empty; retrying in-memory")
-                created_path = mjcf_importer.create_asset_mjcf(path, prim_path, config, "")
+                compat = write_isaac_viewport_mjcf_beside_source(_P(path))
+                if compat is not None:
+                    compat_mjcf_tmp = compat
+                    log.info(
+                        "MJCF import failed on original; retrying with "
+                        "viewport-compat MJCF (geom materials stripped; Isaac 5.1)"
+                    )
+                    for dpath in (dest_path, ""):
+                        created_path = _mjcf_try(str(compat), dpath)
+                        if created_path:
+                            break
 
             if not created_path:
                 raise RuntimeError(
                     f"MJCF importer returned empty prim path for {path} "
-                    f"(tried both file '{dest_path}' and in-memory import)"
+                    f"(tried temp USD + in-memory, then viewport-compat MJCF)"
                 )
             articulation_root = str(created_path)
             log.info(f"MJCF imported at {articulation_root}")
@@ -621,6 +678,12 @@ def _handle_load_robot(msg: dict) -> None:
         with _loaded_names_lock:
             _loaded_robot_names.discard(name)
         _report_load_failure(name, reason)
+    finally:
+        if compat_mjcf_tmp is not None:
+            try:
+                compat_mjcf_tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # Frame playback state

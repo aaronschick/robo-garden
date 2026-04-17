@@ -30,6 +30,7 @@ workspace/approved/
 workspace/runs/
 workspace/renders/
 workspace/environments/
+workspace/_wsl_jobs/
 
 # Claude local config / scheduled-task lockfiles
 .claude/

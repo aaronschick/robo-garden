@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections import OrderedDict
 from typing import Any, Callable  # noqa: F401  Callable used by set_approval_callback signature
 
@@ -55,6 +56,22 @@ def set_approval_callback(cb) -> None:
     _on_approve = cb
 
 
+# Optional live-training progress sink for TUI mode.
+# Signature: (timestep: int, metrics: dict) -> None
+# Set by ChatScreen before starting a chat turn that may invoke training.
+_tui_train_progress: Any | None = None
+
+
+def set_tui_train_progress(cb) -> None:
+    """Register a TUI callback for live training progress updates.
+
+    Called by ChatScreen so TrainingScreen updates in real-time rather than
+    only after the full training run completes.  Pass None to unregister.
+    """
+    global _tui_train_progress
+    _tui_train_progress = cb
+
+
 def get_sim_result(robot_name: str):
     """Retrieve the most recent SimulationResult for *robot_name* (or None).
 
@@ -62,6 +79,11 @@ def get_sim_result(robot_name: str):
     checklist) can inspect simulation state.
     """
     return _sim_results.get(robot_name)
+
+
+def get_catalog_path(robot_name: str):
+    """Return the catalog MJCF Path for *robot_name*, or None if not registered."""
+    return _catalog_paths.get(robot_name)
 
 
 def get_reward_fn(reward_id: str):
@@ -575,7 +597,11 @@ def handle_generate_environment(input: dict) -> dict:
 
     info = model_info(result.model)
     path = ENVIRONMENTS_DIR / f"{name}.xml"
-    path.write_text(mjcf_xml)
+    # MJCF regularly contains non-ASCII characters (Claude emits curly
+    # quotes, µ, °, ≤ in comments / names). Pathlib defaults to the
+    # platform encoding — cp1252 on Windows — which crashes on those.
+    # Force utf-8 to match how every other tool handler writes text.
+    path.write_text(mjcf_xml, encoding="utf-8")
 
     return {
         "success": True,
@@ -681,6 +707,7 @@ def handle_train(input: dict) -> dict:
             log.warning(f"Environment '{env_name}' not found, training without environment MJCF")
 
     reward_fn = None
+    done_fn = None
     reward_fn_code = ""
     reward_id = input.get("reward_function_id", "")
     if reward_id:
@@ -697,19 +724,42 @@ def handle_train(input: dict) -> dict:
                 # ValueError to (0.0, {"_error": ...}) so one bad index does
                 # not kill a long training run.
                 _safe = safe_reward(_raw, fallback=0.0)
+                # Return (scalar, components) tuple so the gym env can surface component data
                 reward_fn = (
-                    lambda obs, action, next_obs, _r=_safe:
-                        float(_r(obs, action, next_obs, {})[0])
+                    lambda obs, action, next_obs, _r=_safe: _r(obs, action, next_obs, {})
                 )
             except Exception as exc:
                 log.warning(f"Could not compile reward function '{reward_id}': {exc}")
+
+            # Compile compute_done if the reward code defines one.
+            # This is critical for locomotion: without early termination after
+            # collapse, the robot runs ~1000 steps at -100/step and the signal
+            # is too noisy for PPO to learn from.
+            try:
+                _globs: dict = {}
+                exec(compile(reward_fn_code, "<reward>", "exec"), _globs)
+                if "compute_done" in _globs and callable(_globs["compute_done"]):
+                    _cd = _globs["compute_done"]
+                    done_fn = lambda next_obs, _f=_cd: bool(_f(next_obs))
+                    log.info("handle_train: compiled compute_done from reward code")
+            except Exception as exc:
+                log.debug(f"handle_train: could not extract compute_done: {exc}")
         else:
             log.warning(f"Reward function '{reward_id}' not found, using default reward")
+
+    # For floating-base robots (freejoint trunk, nq > nv) locomotion needs a
+    # longer horizon — 2500 steps (5 s at dt=0.002) vs. the 1000-step default
+    # which is sufficient for manipulation tasks. Without this the episode ends
+    # before the robot can build up meaningful forward velocity.
+    dims = _lookup_model_dims(robot_name)
+    is_floating_base = bool(dims.get("floating_base", False))
+    default_horizon = 2500 if is_floating_base else 1000
 
     config = TrainingConfig(
         algorithm=input.get("algorithm", "ppo"),
         num_envs=int(input.get("num_envs", 128)),
         total_timesteps=int(input["total_timesteps"]),
+        max_episode_steps=int(input.get("max_episode_steps", default_horizon)),
     )
 
     curriculum_config = None
@@ -757,7 +807,23 @@ def handle_train(input: dict) -> dict:
             total_timesteps=config.total_timesteps,
             algorithm=config.algorithm,
             timesteps_per_second=tps,
+            backend=metrics.get("_backend", ""),
         )
+        if _tui_train_progress is not None:
+            try:
+                _tui_train_progress(timestep, {
+                    **metrics,
+                    "best_reward": best_so_far["reward"],
+                    "elapsed_s": elapsed,
+                    "total_timesteps": config.total_timesteps,
+                    "timesteps_per_second": tps,
+                })
+            except Exception:
+                pass
+        components = metrics.get("components")
+        if components and isinstance(components, dict):
+            from robo_garden.isaac.protocol import make_train_reward_breakdown
+            bridge.send_raw(make_train_reward_breakdown(run_id, timestep, components))
 
     robot_xml = robot_path.read_text(encoding="utf-8")
     # Catalog robots have relative meshdir — rewrite to absolute so the engine
@@ -779,6 +845,7 @@ def handle_train(input: dict) -> dict:
             return
         try:
             from robo_garden.training.rollout import sample_rollout
+            from robo_garden.isaac.protocol import make_train_rollout_preview
 
             rollout = sample_rollout(
                 merged_for_rollout,
@@ -792,34 +859,83 @@ def handle_train(input: dict) -> dict:
                     rollout.qpos,
                     list(rollout.timesteps),
                 )
+                bridge.send_raw(make_train_rollout_preview(
+                    run_id, timestep, num_frames=int(rollout.qpos.shape[0])
+                ))
         except Exception as exc:
             log.debug(f"rollout streaming failed at step {timestep}: {exc}")
 
-    engine = MuJoCoMJXEngine()
-    engine.setup(robot_xml, env_mjcf, config, curriculum_config=curriculum_config)
+    # GPU training path: when ROBO_GARDEN_TRAIN_IN_WSL=1 on Windows, dispatch
+    # the whole run to a wsl.exe subprocess so Claude's reward executes against
+    # JAX/MJX/Brax with CUDA. Progress is piped back through the same
+    # ``_progress`` callback below (which drives the Isaac Sim training panel
+    # and history), so behaviour from Claude's point of view is unchanged —
+    # just faster. Rollout streaming is disabled in this path because the
+    # trained policy params live in the WSL process and aren't easy to
+    # marshal mid-training; we can revisit if the viewport rollouts become
+    # important during gym-mode runs.
+    from robo_garden.training import wsl_dispatch
 
     error_text = ""
     success = False
     result = None
-    try:
-        result = engine.train(
-            reward_fn_code=reward_fn_code,
-            reward_fn=reward_fn,
-            callback=_progress,
-            rollout_callback=_rollout,
-        )
-        success = True
-    except Exception as exc:
-        error_text = f"{type(exc).__name__}: {exc}"
-        log.exception("Training failed")
-    finally:
-        engine.cleanup()
 
-    ended_at = _time.time()
-    training_time = ended_at - started_at
-    best_reward = float(result.best_reward) if result is not None else float("-inf")
-    checkpoint_path = str(result.checkpoint_path) if result is not None else ""
-    reward_curve = list(result.reward_curve) if result is not None else []
+    if wsl_dispatch.is_enabled():
+        _wsl_flag = os.environ.get("ROBO_GARDEN_TRAIN_IN_WSL", "").strip()
+        _wsl_reason = f"ROBO_GARDEN_TRAIN_IN_WSL={_wsl_flag}" if _wsl_flag else "WSL2 auto-detected"
+        log.info(f"Dispatching training to WSL2 (run_id={run_id}) — {_wsl_reason}.")
+        wsl_result = wsl_dispatch.run_in_wsl(
+            run_id=run_id,
+            robot_xml=robot_xml,
+            env_mjcf=env_mjcf,
+            reward_fn_code=reward_fn_code,
+            robot_name=robot_name,
+            environment_name=env_name,
+            algorithm=config.algorithm,
+            total_timesteps=config.total_timesteps,
+            num_envs=config.num_envs,
+            # Locomotion-friendly default; WSL worker honors it verbatim.
+            max_episode_steps=config.max_episode_steps,
+            progress_callback=_progress,
+        )
+        success = bool(wsl_result.get("success", False))
+        error_text = str(wsl_result.get("error", ""))
+        best_reward_wsl = float(wsl_result.get("best_reward", float("-inf")))
+        reward_curve_wsl = wsl_result.get("reward_curve", []) or []
+        checkpoint_path_wsl = str(wsl_result.get("checkpoint_path", ""))
+        ended_at = _time.time()
+        training_time = float(
+            wsl_result.get("training_time_seconds", ended_at - started_at)
+        )
+        # Fall through to the existing run-record / bridge-end / return path
+        # with the same variables that the in-process branch populates.
+        best_reward = best_reward_wsl
+        reward_curve = list(reward_curve_wsl)
+        checkpoint_path = checkpoint_path_wsl
+    else:
+        engine = MuJoCoMJXEngine()
+        engine.setup(robot_xml, env_mjcf, config, curriculum_config=curriculum_config)
+
+        try:
+            result = engine.train(
+                reward_fn_code=reward_fn_code,
+                reward_fn=reward_fn,
+                done_fn=done_fn,
+                callback=_progress,
+                rollout_callback=_rollout,
+            )
+            success = True
+        except Exception as exc:
+            error_text = f"{type(exc).__name__}: {exc}"
+            log.exception("Training failed")
+        finally:
+            engine.cleanup()
+
+        ended_at = _time.time()
+        training_time = ended_at - started_at
+        best_reward = float(result.best_reward) if result is not None else float("-inf")
+        checkpoint_path = str(result.checkpoint_path) if result is not None else ""
+        reward_curve = list(result.reward_curve) if result is not None else []
 
     run_record = {
         "run_id": run_id,
@@ -859,6 +975,14 @@ def handle_train(input: dict) -> dict:
             "isaac_connected": bridge.connected,
         }
 
+    # Describe reward curve trend to help Claude decide whether to refine.
+    _curve_rewards = [r for _, r in reward_curve] if reward_curve else []
+    if len(_curve_rewards) >= 2:
+        _trend = _curve_rewards[-1] - _curve_rewards[0]
+        _trend_desc = f"improved by {_trend:.3f}" if _trend > 0 else f"did not improve ({_trend:.3f})"
+    else:
+        _trend_desc = "insufficient data"
+
     return {
         "success": True,
         "run_id": run_id,
@@ -869,6 +993,22 @@ def handle_train(input: dict) -> dict:
         "recent_updates": updates[-5:],
         "checkpoint_path": checkpoint_path,
         "isaac_connected": bridge.connected,
+        "eureka_refinement": {
+            "suggestion": (
+                "To improve results iteratively (Eureka-style): call generate_reward "
+                "with previous_stats below, then train again. Repeat 2-3 times."
+            ),
+            "previous_stats": {
+                "mean_reward": best_reward,
+                "reward_trend": _trend_desc,
+                "reward_curve_tail": reward_curve[-5:],
+                "reward_function_id": reward_id,
+            },
+        },
+        "review_hint": (
+            f"Call review_run(run_id='{run_id}') to replay this policy "
+            "in the Isaac viewport and optionally save a video."
+        ),
     }
 
 
@@ -1019,6 +1159,133 @@ def handle_approve_for_training(input: dict) -> dict:
     }
 
 
+@register_handler("review_run")
+def handle_review_run(input: dict) -> dict:
+    """Load a training checkpoint, run a policy rollout, stream to viewport, optionally save video."""
+    from pathlib import Path
+    from robo_garden.training.history import load_recent
+    from robo_garden.training.mujoco_engine import MuJoCoMJXEngine, _merge_mjcf
+    from robo_garden.training.models import TrainingConfig
+    from robo_garden.isaac import get_bridge
+    from robo_garden.config import ROBOTS_DIR, ENVIRONMENTS_DIR, RENDERS_DIR
+
+    run_id = input.get("run_id", "latest")
+    num_frames = int(input.get("num_frames", 150))
+    render_video = bool(input.get("render_video", False))
+
+    runs = load_recent(limit=50)
+    run = None
+    if run_id == "latest":
+        run = next((r for r in runs if r.get("success")), None)
+    else:
+        run = next((r for r in runs if r.get("run_id") == run_id), None)
+
+    if run is None:
+        return {
+            "success": False,
+            "error": (
+                f"No run found with id='{run_id}'. "
+                "Pass run_id='latest' or a run_id from the train tool result."
+            ),
+        }
+
+    checkpoint_path = run.get("checkpoint_path", "")
+    robot_name = run.get("robot_name", "")
+    env_name = run.get("environment_name", "")
+    resolved_run_id = run.get("run_id", run_id)
+
+    if not checkpoint_path:
+        return {"success": False, "error": "Run record has no checkpoint_path.", "run_id": resolved_run_id}
+
+    robot_path: Path | None = None
+    if robot_name in _catalog_paths:
+        robot_path = _catalog_paths[robot_name]
+    else:
+        for ext in (".xml", ".urdf"):
+            p = ROBOTS_DIR / f"{robot_name}{ext}"
+            if p.exists():
+                robot_path = p
+                break
+
+    if robot_path is None:
+        return {
+            "success": False,
+            "error": f"Robot '{robot_name}' XML not found — it may have been generated in a different session.",
+            "run_id": resolved_run_id,
+        }
+
+    robot_xml = robot_path.read_text(encoding="utf-8")
+    if robot_name in _catalog_paths:
+        robot_xml = _absolutize_asset_paths(robot_xml, robot_path.parent)
+
+    env_xml = ""
+    if env_name:
+        env_path = ENVIRONMENTS_DIR / f"{env_name}.xml"
+        if env_path.exists():
+            env_xml = env_path.read_text(encoding="utf-8")
+
+    merged_mjcf = _merge_mjcf(robot_xml, env_xml)
+
+    engine = MuJoCoMJXEngine()
+    engine._merged_mjcf = merged_mjcf
+    engine.config = TrainingConfig(num_envs=1, total_timesteps=0)
+
+    rollout = engine.rollout_from_checkpoint(checkpoint_path, num_frames=num_frames)
+    if rollout is None:
+        return {"success": False, "error": "Rollout failed — could not build merged MJCF.", "run_id": resolved_run_id}
+
+    bridge = get_bridge()
+    if bridge.connected and rollout.qpos.shape[0] > 0:
+        bridge.stream_qpos_batch(robot_name, rollout.qpos, list(rollout.timesteps))
+
+    policy_type = "sb3_checkpoint" if (Path(checkpoint_path) / "policy.zip").exists() else "zero_action"
+
+    response: dict = {
+        "success": True,
+        "run_id": resolved_run_id,
+        "robot_name": robot_name,
+        "policy_type": policy_type,
+        "num_frames": int(rollout.qpos.shape[0]),
+        "rollout_success": rollout.success,
+        "isaac_connected": bridge.connected,
+        "best_reward": run.get("best_reward"),
+        "algorithm": run.get("algorithm"),
+    }
+
+    if policy_type == "zero_action":
+        response["note"] = (
+            "Brax/JAX policies require the inference function from training to replay. "
+            "Showing zero-action (passive dynamics) rollout instead. "
+            "The robot's passive stability and joint layout are visible."
+        )
+
+    if render_video:
+        video_path = RENDERS_DIR / f"{robot_name}_rollout_{resolved_run_id}.mp4"
+        try:
+            import mujoco
+            import imageio
+            import numpy as np
+
+            model = mujoco.MjModel.from_xml_string(merged_mjcf)
+            data = mujoco.MjData(model)
+            renderer = mujoco.Renderer(model, height=480, width=640)
+            mujoco.mj_resetData(model, data)
+
+            frames = []
+            for qpos_frame in rollout.qpos:
+                data.qpos[:model.nq] = qpos_frame[:model.nq]
+                mujoco.mj_kinematics(model, data)
+                renderer.update_scene(data)
+                frames.append(renderer.render().copy())
+
+            imageio.mimsave(str(video_path), frames, fps=30)
+            response["video_path"] = str(video_path)
+        except Exception as exc:
+            response["video_error"] = str(exc)
+
+    return response
+
+
 @register_handler("query_catalog")
 def handle_query_catalog(input: dict) -> dict:
     """Search actuator/material/robot catalogs."""
@@ -1098,3 +1365,54 @@ def handle_query_catalog(input: dict) -> dict:
 
     else:
         return {"error": f"Unknown catalog: '{catalog}'. Use 'actuators', 'materials', or 'robots'."}
+
+
+@register_handler("promote_skill")
+def handle_promote_skill(input: dict) -> dict:
+    """Copy a training checkpoint into the Skills Library and write manifests."""
+    from robo_garden.training.history import load_recent, find_run
+    from robo_garden.skills.promote import promote_run_to_skill
+
+    run_id = (input.get("run_id") or "").strip()
+    skill_id = (input.get("skill_id") or "").strip()
+    display_name = (input.get("display_name") or "").strip()
+    task_description = (input.get("task_description") or "").strip()
+
+    if not skill_id:
+        return {"success": False, "error": "skill_id is required"}
+    if not display_name:
+        return {"success": False, "error": "display_name is required"}
+
+    if run_id == "latest":
+        recent = load_recent(limit=50)
+        run_record = next((r for r in recent if r.get("success")), None)
+        if run_record is None:
+            return {"success": False, "error": "No successful training run found in history"}
+        run_id = run_record["run_id"]
+
+    try:
+        variant = promote_run_to_skill(
+            run_id=run_id,
+            skill_id=skill_id,
+            display_name=display_name,
+            task_description=task_description,
+        )
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+    except Exception as exc:
+        log.exception("promote_skill failed")
+        return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    return {
+        "success": True,
+        "run_id": run_id,
+        "skill_id": skill_id,
+        "display_name": display_name,
+        "variant_id": variant.variant_id,
+        "checkpoint_path": variant.checkpoint_path,
+        "best_reward": variant.best_reward,
+        "message": (
+            f"Skill '{display_name}' (variant {variant.variant_id}) saved to the "
+            f"Skills Library. It is now visible in the Skills tab."
+        ),
+    }

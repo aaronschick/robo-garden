@@ -66,6 +66,7 @@ class MuJoCoGymEnv(gym.Env):
 
         self._step_count = 0
         self._rng = np.random.default_rng(0)
+        self.last_reward_components: dict = {}
 
     # ------------------------------------------------------------------
     # gymnasium interface
@@ -102,9 +103,15 @@ class MuJoCoGymEnv(gym.Env):
 
         if self.reward_fn is not None:
             raw_r = self.reward_fn(prev_obs, action, obs)
-            reward = float(raw_r[0]) if isinstance(raw_r, tuple) else float(raw_r)
+            if isinstance(raw_r, tuple) and len(raw_r) == 2:
+                reward = float(raw_r[0])
+                self.last_reward_components = raw_r[1] if isinstance(raw_r[1], dict) else {}
+            else:
+                reward = float(raw_r)
+                self.last_reward_components = {}
         else:
             reward = float(-0.1 * np.sum(action ** 2))
+            self.last_reward_components = {}
 
         diverged = bool(np.any(np.isnan(obs)))
         early_done = bool(self.done_fn(obs)) if self.done_fn is not None else False
@@ -170,3 +177,126 @@ def cartpole_done_jax(next_obs) -> bool:
     pole_angle = jnp.abs(next_obs[1])
     cart_pos = jnp.abs(next_obs[0])
     return jnp.logical_or(pole_angle > jnp.float32(0.785), cart_pos > jnp.float32(2.3))
+
+
+# ---------------------------------------------------------------------------
+# Go2 walker helpers
+# ---------------------------------------------------------------------------
+#
+# Observation layout (from workspace/robots/go2_walker.xml): obs = [qpos, qvel]
+# with nq=19, nv=18, obs_dim=37.
+#   qpos[0:3]   = trunk xyz                 qvel[0:3]   = trunk linear velocity
+#   qpos[3:7]   = trunk quaternion (wxyz)   qvel[3:6]   = trunk angular velocity
+#   qpos[7:19]  = 12 hinge joint angles     qvel[6:18]  = 12 joint velocities
+#
+# Action layout: 12 motors, one per joint, order matches <actuator> block,
+# ctrlrange = [-23.7, 23.7] Nm.  PPO emits actions in [-1, 1] (tanh-squashed);
+# MJXBraxEnv / MuJoCoGymEnv scale that to ctrlrange before applying torque.
+
+_GO2_STAND_HEIGHT = 0.41       # target trunk z (m) for a nominally-standing Go2
+_GO2_COLLAPSE_Z = 0.15         # below this z, episode is terminated with a big
+                               # negative reward — prevents the policy from
+                               # learning to lie flat and collect cheap rewards.
+
+
+def go2_walker_reward(obs: np.ndarray, action: np.ndarray, next_obs: np.ndarray) -> float:
+    """NumPy reward for Go2 forward-trotting (SB3 / CPU path).
+
+    Matches the reward structure in workspace/prompts/go2_walker_phase2_train.txt:
+      R = 2.0*R_forward + 1.0*R_height + 0.5*R_smooth + 0.1*R_energy + R_termination
+
+    A collapse (trunk below 15 cm) ends the episode with -100 so the policy
+    must stay upright to collect forward-velocity reward.
+    """
+    vx = float(next_obs[19])           # qvel[0] = trunk forward velocity
+    z = float(next_obs[2])             # qpos[2] = trunk height
+    qvel_prev = obs[19 + 6 : 19 + 18]  # 12 prior joint velocities
+    qvel_next = next_obs[19 + 6 : 19 + 18]
+    joint_accel = qvel_next - qvel_prev
+    ctrl = np.asarray(action, dtype=np.float32)
+
+    r_forward = np.clip(vx, 0.0, 4.0)
+    r_height = np.exp(-10.0 * (z - _GO2_STAND_HEIGHT) ** 2)
+    r_smooth = -float(np.mean(np.abs(joint_accel)))
+    r_energy = -float(np.mean(np.abs(ctrl * qvel_next)))
+    r_term = -100.0 if z < _GO2_COLLAPSE_Z else 0.0
+
+    return float(
+        2.0 * r_forward
+        + 1.0 * r_height
+        + 0.5 * r_smooth
+        + 0.1 * r_energy
+        + r_term
+    )
+
+
+def go2_walker_done(next_obs: np.ndarray) -> bool:
+    """Terminate when trunk collapses below 15 cm."""
+    return bool(next_obs[2] < _GO2_COLLAPSE_Z)
+
+
+def go2_walker_reward_jax(obs, action, next_obs):
+    """JAX-native Go2 forward-trotting reward — JIT-compilable for Brax PPO."""
+    import jax.numpy as jnp
+
+    vx = next_obs[19]
+    z = next_obs[2]
+    qvel_prev = obs[19 + 6 : 19 + 18]
+    qvel_next = next_obs[19 + 6 : 19 + 18]
+    joint_accel = qvel_next - qvel_prev
+
+    r_forward = jnp.clip(vx, 0.0, 4.0)
+    r_height = jnp.exp(jnp.float32(-10.0) * (z - jnp.float32(_GO2_STAND_HEIGHT)) ** 2)
+    r_smooth = -jnp.mean(jnp.abs(joint_accel))
+    r_energy = -jnp.mean(jnp.abs(action * qvel_next))
+    r_term = jnp.where(z < jnp.float32(_GO2_COLLAPSE_Z), jnp.float32(-100.0), jnp.float32(0.0))
+
+    return (
+        jnp.float32(2.0) * r_forward
+        + jnp.float32(1.0) * r_height
+        + jnp.float32(0.5) * r_smooth
+        + jnp.float32(0.1) * r_energy
+        + r_term
+    )
+
+
+def go2_walker_done_jax(next_obs):
+    """JAX-native collapse-termination check — JIT-compilable."""
+    import jax.numpy as jnp
+
+    return next_obs[2] < jnp.float32(_GO2_COLLAPSE_Z)
+
+
+# ---------------------------------------------------------------------------
+# Built-in reward source strings for --mode train WSL dispatch
+# ---------------------------------------------------------------------------
+# These are the compute_reward source strings that wsl_dispatch.run_in_wsl()
+# embeds in job.json so the WSL worker can compile them.  They mirror the
+# logic of the NumPy reward functions above but written as standalone
+# compute_reward(obs, action, next_obs, info) -> tuple[float, dict] bodies.
+
+BUILTIN_REWARD_SOURCE: dict[str, str] = {
+    "cartpole": """\
+def compute_reward(obs, action, next_obs, info):
+    pole_angle = next_obs[1]
+    cart_pos = next_obs[0]
+    ctrl_cost = 0.001 * np.sum(action ** 2)
+    r = np.cos(pole_angle) - 0.1 * cart_pos ** 2 - ctrl_cost
+    return float(r), {}
+""",
+    "go2_walker": """\
+def compute_reward(obs, action, next_obs, info):
+    vx = next_obs[19]
+    z = next_obs[2]
+    qvel_prev = obs[25:37]
+    qvel_next = next_obs[25:37]
+    joint_accel = qvel_next - qvel_prev
+    r_forward = np.clip(vx, 0.0, 4.0)
+    r_height = np.exp(-10.0 * (z - 0.41) ** 2)
+    r_smooth = -float(np.mean(np.abs(joint_accel)))
+    r_energy = -float(np.mean(np.abs(action * qvel_next)))
+    r_term = -100.0 if z < 0.15 else 0.0
+    r = 2.0 * r_forward + 1.0 * r_height + 0.5 * r_smooth + 0.1 * r_energy + r_term
+    return float(r), {}
+""",
+}

@@ -15,7 +15,7 @@ def save_checkpoint(params, path: Path, metadata: dict | None = None) -> Path:
 
     if metadata:
         meta_path = path.with_suffix(".json")
-        meta_path.write_text(json.dumps(metadata, indent=2, default=str))
+        meta_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
 
     if params is not None:
         try:

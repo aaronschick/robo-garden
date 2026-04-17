@@ -26,8 +26,21 @@ TRAIN_RUN_START = "TRAIN_RUN_START"
 TRAIN_UPDATE = "TRAIN_UPDATE"
 TRAIN_RUN_END = "TRAIN_RUN_END"
 TRAIN_HISTORY = "TRAIN_HISTORY"
+# Mid-training rollout preview (backend → UI):
+#   Sent each time a mid-training rollout is streamed to the viewport.
+#   UI adds a timestamped replay button so the user can re-watch it later.
+TRAIN_ROLLOUT_PREVIEW = "TRAIN_ROLLOUT_PREVIEW"  # {"run_id": str, "timestep": int, "num_frames": int}
+# Per-component reward breakdown (backend → UI):
+#   Optional; sent alongside TRAIN_UPDATE when the reward function returns
+#   a (scalar, components_dict) tuple.
+TRAIN_REWARD_BREAKDOWN = "TRAIN_REWARD_BREAKDOWN"  # {"run_id": str, "timestep": int, "components": {k: float}}
 PING = "PING"
 PONG = "PONG"
+# Replay a completed training run's rollout in the viewport.
+# Can be sent by either side:
+#   UI → backend: user clicked a run in history → replay it
+#   backend → UI: proactively push a rollout after training ends
+REVIEW_RUN = "REVIEW_RUN"  # {"run_id": str}
 
 # --- Bidirectional messages added for the Design Studio ---
 # Isaac Sim UI -> robo-garden backend
@@ -48,6 +61,29 @@ TOOL_RESULT = "TOOL_RESULT"         # {"tool": str, "summary": str, "success": b
 PHASE_CHANGED = "PHASE_CHANGED"     # {"phase": "design"|"training", "approved_robot": str|None, ...}
 ROBOT_META = "ROBOT_META"           # {"name": str, "joints": [{"name": str, "range": [lo,hi], "type": str}], "bodies": [str]}
 GATE_STATUS = "GATE_STATUS"         # {"robot_loaded": bool, "env_loaded": bool, "sim_stable": bool, "can_approve": bool}
+
+# Mode switching (bidirectional)
+MODE_REQUEST = "MODE_REQUEST"       # UI → backend: {"mode": str, "context": {}}
+MODE_CHANGED = "MODE_CHANGED"       # backend → UI: {"mode": str, "available_modes": [str], "context": {}, "reason": str}
+
+# Skills Library
+SKILL_LIST = "SKILL_LIST"               # backend → UI: {"robot_name": str|None, "skills": [...]}
+SKILL_PROMOTE = "SKILL_PROMOTE"         # UI → backend: {"run_id": str, "skill_id": str, "display_name": str, "task_description": str}
+
+# Gamepad echo (backend → UI, ~10 Hz)
+GAMEPAD_INPUT = "GAMEPAD_INPUT"     # backend → UI: {"axes": [...], "buttons": {...}, "connected": bool, "ts": float}
+
+# Live policy playback (Simulate mode)
+SKILL_SELECT = "SKILL_SELECT"           # UI → backend: {"robot_name": str, "skill_id": str, "variant_id": str|null}
+POLICY_PLAYBACK_START = "POLICY_PLAYBACK_START"  # UI → backend: {"robot_name": str, "skill_id": str, "variant_id": str} OR {"robot_name": str, "policy_name": str}
+POLICY_PLAYBACK_STOP = "POLICY_PLAYBACK_STOP"    # UI → backend: {}
+POLICY_PLAYBACK_STATUS = "POLICY_PLAYBACK_STATUS"  # backend → UI: {"state": "playing"|"paused"|"stopped", "skill_id": str, "robot_name": str}
+
+# Policy Composer
+POLICY_LIST = "POLICY_LIST"     # backend → UI: {"robot_name": str|None, "policies": [...]}
+POLICY_SAVE = "POLICY_SAVE"     # UI → backend: {"robot_name": str, "policy_name": str, "composition": str, "skills": [...]}
+POLICY_LOAD = "POLICY_LOAD"     # UI → backend: {"robot_name": str, "policy_name": str}
+POLICY_DELETE = "POLICY_DELETE" # UI → backend: {"robot_name": str, "policy_name": str}
 
 
 def make_load_robot(name: str, path: Path, fmt: str = "mjcf") -> dict:
@@ -148,6 +184,7 @@ def make_train_update(
     total_timesteps: int | None = None,
     algorithm: str = "",
     timesteps_per_second: float | None = None,
+    backend: str = "",
     **kwargs,
 ) -> dict:
     """Periodic training progress update driving the Studio progress panel."""
@@ -158,6 +195,7 @@ def make_train_update(
         "timestep": int(timestep),
         "mean_reward": float(mean_reward),
         "algorithm": algorithm,
+        "backend": backend,
         "ts": time.time(),
     }
     if best_reward is not None:
@@ -207,6 +245,33 @@ def make_train_run_end(
         "ts": time.time(),
         **kwargs,
     }
+
+
+def make_train_rollout_preview(run_id: str, timestep: int, num_frames: int = 0) -> dict:
+    """Notify the UI that a mid-training rollout was just streamed to the viewport."""
+    return {
+        "type": TRAIN_ROLLOUT_PREVIEW,
+        "run_id": run_id,
+        "timestep": int(timestep),
+        "num_frames": int(num_frames),
+        "ts": time.time(),
+    }
+
+
+def make_train_reward_breakdown(run_id: str, timestep: int, components: dict) -> dict:
+    """Per-component reward breakdown for the Training panel stacked-bar display."""
+    return {
+        "type": TRAIN_REWARD_BREAKDOWN,
+        "run_id": run_id,
+        "timestep": int(timestep),
+        "components": {k: float(v) for k, v in components.items()},
+        "ts": time.time(),
+    }
+
+
+def make_review_run(run_id: str) -> dict:
+    """Request replay of a completed training run's rollout."""
+    return {"type": REVIEW_RUN, "run_id": run_id, "ts": time.time()}
 
 
 def make_train_history(runs: list[dict]) -> dict:
@@ -332,6 +397,83 @@ def make_robot_meta(name: str, joints: list[dict], bodies: list[str]) -> dict:
         "name": name,
         "joints": joints,
         "bodies": bodies,
+        "ts": time.time(),
+    }
+
+
+def make_mode_changed(
+    mode: str,
+    available_modes: list[str],
+    context: dict | None = None,
+    reason: str = "",
+) -> dict:
+    """Broadcast the current activity mode and which modes are available."""
+    return {
+        "type": MODE_CHANGED,
+        "mode": mode,
+        "available_modes": list(available_modes),
+        "context": context or {},
+        "reason": reason,
+        "ts": time.time(),
+    }
+
+
+def make_mode_request(mode: str, context: dict | None = None) -> dict:
+    """Request a mode switch from the UI."""
+    return {
+        "type": MODE_REQUEST,
+        "mode": mode,
+        "context": context or {},
+        "ts": time.time(),
+    }
+
+
+def make_gamepad_input(axes: list, buttons: dict, connected: bool) -> dict:
+    """Echo gamepad state to the Studio UI at ~10 Hz."""
+    return {
+        "type": GAMEPAD_INPUT,
+        "axes": list(axes),
+        "buttons": dict(buttons),
+        "connected": bool(connected),
+        "ts": time.time(),
+    }
+
+
+def make_policy_playback_status(
+    state: str,
+    skill_id: str = "",
+    robot_name: str = "",
+    variant_id: str = "",
+    error: str = "",
+) -> dict:
+    """Inform the UI of playback state changes."""
+    return {
+        "type": POLICY_PLAYBACK_STATUS,
+        "state": state,
+        "skill_id": skill_id,
+        "robot_name": robot_name,
+        "variant_id": variant_id,
+        "error": error,
+        "ts": time.time(),
+    }
+
+
+def make_skill_list(skills: list[dict], robot_name: str | None = None) -> dict:
+    """Broadcast the current Skills Library contents to the UI."""
+    return {
+        "type": SKILL_LIST,
+        "robot_name": robot_name,
+        "skills": list(skills),
+        "ts": time.time(),
+    }
+
+
+def make_policy_list(policies: list[dict], robot_name: str | None = None) -> dict:
+    """Broadcast the current Policy Composer library to the UI."""
+    return {
+        "type": POLICY_LIST,
+        "robot_name": robot_name,
+        "policies": list(policies),
         "ts": time.time(),
     }
 

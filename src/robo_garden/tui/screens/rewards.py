@@ -15,6 +15,12 @@ class RewardsScreen(Widget):
         Binding("ctrl+l", "clear_log", "Clear"),
     ]
 
+    def __init__(self) -> None:
+        super().__init__()
+        # Tracks line index per iteration so update_best_reward can append a
+        # follow-up line rather than trying to mutate the immutable RichLog.
+        self._iteration_descriptions: dict[int, str] = {}
+
     def compose(self) -> ComposeResult:
         yield RichLog(id="log", wrap=True, markup=True, highlight=False)
 
@@ -31,11 +37,26 @@ class RewardsScreen(Widget):
     ) -> None:
         """Append a formatted reward-iteration row to the log."""
         log = self.query_one("#log", RichLog)
+        self._iteration_descriptions[iteration] = description
+        reward_str = (
+            f"mean={mean_reward:>8.3f}  max={max_reward:>8.3f}"
+            if mean_reward != 0.0 or max_reward != 0.0
+            else "[dim]training pending…[/dim]"
+        )
         log.write(
             f"[bold]#{iteration:>3}[/bold]  "
-            f"mean={mean_reward:>8.3f}  "
-            f"max={max_reward:>8.3f}  "
+            f"{reward_str}  "
             f"[dim]{description}[/dim]"
+        )
+
+    def update_best_reward(self, iteration: int, best_reward: float) -> None:
+        """Append a training-result line for an existing iteration."""
+        log = self.query_one("#log", RichLog)
+        desc = self._iteration_descriptions.get(iteration, "")
+        log.write(
+            f"[bold]#{iteration:>3}[/bold]  "
+            f"[green]best={best_reward:>8.3f}[/green]  "
+            f"[dim]{desc} — training complete[/dim]"
         )
 
     def action_clear_log(self) -> None:

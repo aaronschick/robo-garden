@@ -1,9 +1,11 @@
-"""Main Textual application with tab-based navigation across all 5 spaces.
+"""Main Textual application — mode-taxonomy tabs mirroring the Isaac Sim extension.
 
-Also exposes a keyboard shortcut ``s`` / action ``open_studio`` which launches
-the Isaac Sim Design Studio (by spawning the server script and running
-``robo-garden --mode studio`` in the foreground).  The Textual TUI continues
-to act as the headless-friendly launcher / status hub.
+Tab layout:
+  Home | Design (Chat / Robot / Envs) | Simulate | Train (Progress / Rewards)
+  | Skills | Compose | Deploy
+
+The `s` keybinding (and the robo-garden-app launcher) still spawns Isaac Sim +
+the Studio backend in external windows when running standalone.
 """
 
 from __future__ import annotations
@@ -15,11 +17,13 @@ from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, TabbedContent, TabPane
 
+from robo_garden.tui.screens.home import HomeScreen
 from robo_garden.tui.screens.chat import ChatScreen
 from robo_garden.tui.screens.building import BuildingScreen
 from robo_garden.tui.screens.environments import EnvironmentsScreen
 from robo_garden.tui.screens.training import TrainingScreen
 from robo_garden.tui.screens.rewards import RewardsScreen
+from robo_garden.tui.screens.stub import StubScreen
 
 
 class RoboGardenApp(App):
@@ -30,6 +34,8 @@ class RoboGardenApp(App):
     Screen { background: $surface; }
     TabbedContent { height: 1fr; }
     TabPane { padding: 0; height: 1fr; }
+    #home-welcome { padding: 1 2; }
+    #home-log { height: auto; padding: 0 2; }
     """
 
     BINDINGS = [
@@ -37,19 +43,67 @@ class RoboGardenApp(App):
         ("s", "open_studio", "Open Studio"),
     ]
 
+    def __init__(self, studio_connected: bool = False) -> None:
+        super().__init__()
+        self.studio_connected = studio_connected
+
     def compose(self) -> ComposeResult:
         yield Header()
-        with TabbedContent():
-            with TabPane("Chat", id="tab-chat"):
-                yield ChatScreen()
-            with TabPane("Building", id="tab-building"):
-                yield BuildingScreen()
-            with TabPane("Environments", id="tab-environments"):
-                yield EnvironmentsScreen()
-            with TabPane("Training", id="tab-training"):
-                yield TrainingScreen()
-            with TabPane("Rewards", id="tab-rewards"):
-                yield RewardsScreen()
+        with TabbedContent(id="modes"):
+            # ── Home ───────────────────────────────────────────────────
+            with TabPane("Home", id="tab-home"):
+                yield HomeScreen()
+
+            # ── Design (Chat + Building + Environments) ────────────────
+            with TabPane("Design", id="tab-design"):
+                with TabbedContent():
+                    with TabPane("Chat", id="tab-design-chat"):
+                        yield ChatScreen()
+                    with TabPane("Robot", id="tab-design-robot"):
+                        yield BuildingScreen()
+                    with TabPane("Environments", id="tab-design-envs"):
+                        yield EnvironmentsScreen()
+
+            # ── Simulate (Phase 4) ─────────────────────────────────────
+            with TabPane("Simulate", id="tab-simulate"):
+                yield StubScreen(
+                    "Simulate",
+                    "Load any robot and drive it with a gamepad.",
+                    "Phase 4",
+                )
+
+            # ── Train (Progress + Rewards) ─────────────────────────────
+            with TabPane("Train", id="tab-train"):
+                with TabbedContent():
+                    with TabPane("Progress", id="tab-train-progress"):
+                        yield TrainingScreen()
+                    with TabPane("Rewards", id="tab-train-rewards"):
+                        yield RewardsScreen()
+
+            # ── Skills (Phase 3) ───────────────────────────────────────
+            with TabPane("Skills", id="tab-skills"):
+                yield StubScreen(
+                    "Skills Library",
+                    "Browse named behaviors per robot and play them back.",
+                    "Phase 3",
+                )
+
+            # ── Compose (Phase 6) ──────────────────────────────────────
+            with TabPane("Compose", id="tab-compose"):
+                yield StubScreen(
+                    "Policy Composer",
+                    "Combine skills into named policy versions.",
+                    "Phase 6",
+                )
+
+            # ── Deploy (Phase 8) ───────────────────────────────────────
+            with TabPane("Deploy", id="tab-deploy"):
+                yield StubScreen(
+                    "Deploy / Export",
+                    "Export checkpoints for real-world deployment.",
+                    "Phase 8",
+                )
+
         yield Footer()
 
     # ------------------------------------------------------------------
@@ -60,11 +114,7 @@ class RoboGardenApp(App):
         """Launch the Isaac Sim Design Studio in an external terminal.
 
         Spawns two processes detached from the TUI so the user can continue
-        using the Textual interface while the Studio runs:
-          1. Isaac Sim server (isaac_server/launch.ps1)
-          2. robo-garden --mode studio (connects to it)
-
-        On non-Windows or when PowerShell is unavailable, prints instructions.
+        using the Textual interface while the Studio runs.
         """
         from rich.console import Console
         console = Console()

@@ -52,14 +52,28 @@ def _run_training_live(
     total_timesteps: int,
     num_envs: int,
     reward_fn: Callable | None = None,
+    done_fn: Callable | None = None,
     jax_reward_fn: Callable | None = None,
     jax_done_fn: Callable | None = None,
+    max_episode_steps: int | None = None,
+    wsl_run_id: str | None = None,
+    reward_fn_code: str = "",
+    use_wsl: bool = False,
 ) -> None:
     """Run training with a Rich Live terminal display.
 
+    When ``use_wsl=True`` (Windows with WSL2 GPU available), the job is
+    dispatched to the WSL worker via ``wsl_dispatch.run_in_wsl()`` and
+    ``__RG_PROGRESS__`` ticks drive the same Rich display as the local path.
+
     On Linux/WSL2 (JAX GPU available), ``jax_reward_fn`` / ``jax_done_fn`` are
-    forwarded to the Brax PPO path.  On Windows, ``reward_fn`` (numpy) is used
-    by the SB3 PPO fallback.
+    forwarded to the Brax PPO path.  On Windows without WSL, ``reward_fn`` /
+    ``done_fn`` (numpy) are used by the SB3 PPO fallback.
+
+    ``max_episode_steps`` defaults to 500, which is fine for cartpole at
+    dt=0.02 (10 s episodes) but far too short for locomotion at dt=0.002
+    (just 1 s).  Locomotion tasks should pass ``max_episode_steps=2500`` or
+    more so the policy has time to develop a gait before truncation.
     """
     from rich.console import Console
     from rich.live import Live
@@ -73,20 +87,14 @@ def _run_training_live(
 
     console = Console()
 
-    config = TrainingConfig(
-        num_envs=num_envs,
-        total_timesteps=total_timesteps,
-        max_episode_steps=500,
-    )
-    engine = MuJoCoMJXEngine()
-    engine.setup(robot_path.read_text(encoding="utf-8"), "", config)
+    _ep_steps = max_episode_steps if max_episode_steps is not None else 500
 
     state: dict = {
         "step": 0,
         "mean_reward": 0.0,
         "best_reward": float("-inf"),
         "reward_history": [],
-        "algorithm": "starting…",
+        "algorithm": "Brax PPO (GPU/JAX)" if use_wsl else "starting…",
         "start_time": time.time(),
     }
 
@@ -128,12 +136,75 @@ def _run_training_live(
 
     def _on_step(step: int, metrics: dict) -> None:
         mean_r = float(metrics.get("eval/episode_reward", metrics.get("mean_reward", 0.0)))
+        backend = metrics.get("_backend", "")
+        if backend and not backend.endswith("compiling...") and not backend.endswith("VRAM..."):
+            state["algorithm"] = backend
         state["step"] = step
         state["mean_reward"] = mean_r
         if mean_r > state["best_reward"]:
             state["best_reward"] = mean_r
         state["reward_history"].append(mean_r)
         progress.update(task_id, completed=min(step, total_timesteps))
+
+    console.print(
+        f"\n[bold cyan]Robo Garden[/] — training [bold]{robot_name}[/] "
+        f"for [bold]{total_timesteps:,}[/] timesteps"
+        + (" [dim](WSL2 GPU)[/dim]" if use_wsl else "")
+        + "\n"
+    )
+
+    if use_wsl:
+        # ── WSL GPU path ─────────────────────────────────────────────────
+        # Dispatch to the WSL worker via the same run_in_wsl() path used by
+        # handle_train (gym/tui mode).  Progress ticks flow back over
+        # __RG_PROGRESS__ stdout and drive the same Rich panel as the local path.
+        from datetime import datetime, timezone
+        from uuid import uuid4
+        from robo_garden.training import wsl_dispatch
+
+        run_id = wsl_run_id or (
+            f"run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:6]}"
+        )
+
+        with Live(console=console, refresh_per_second=4, transient=False) as live:
+            def _live_callback(step: int, metrics: dict) -> None:
+                _on_step(step, metrics)
+                live.update(_make_panel())
+
+            wsl_result = wsl_dispatch.run_in_wsl(
+                run_id=run_id,
+                robot_xml=robot_path.read_text(encoding="utf-8"),
+                env_mjcf="",
+                reward_fn_code=reward_fn_code,
+                robot_name=robot_name,
+                environment_name=robot_name,
+                algorithm="ppo",
+                total_timesteps=total_timesteps,
+                num_envs=num_envs,
+                max_episode_steps=_ep_steps,
+                progress_callback=_live_callback,
+            )
+            live.update(_make_panel())
+
+        if wsl_result.get("success"):
+            console.print(
+                f"\n[bold green]Done![/]  "
+                f"best_reward=[bold]{wsl_result.get('best_reward', 0.0):.3f}[/]  "
+                f"time=[bold]{wsl_result.get('training_time_seconds', 0.0):.1f}s[/]  "
+                f"checkpoint=[dim]{wsl_result.get('checkpoint_path', '')}[/]"
+            )
+        else:
+            console.print(f"\n[bold red]WSL training failed:[/] {wsl_result.get('error', 'unknown error')}")
+        return
+
+    # ── Local path (engine runs in-process) ──────────────────────────────
+    config = TrainingConfig(
+        num_envs=num_envs,
+        total_timesteps=total_timesteps,
+        max_episode_steps=_ep_steps,
+    )
+    engine = MuJoCoMJXEngine()
+    engine.setup(robot_path.read_text(encoding="utf-8"), "", config)
 
     # Patch engine methods to capture algorithm name before they run
     _orig_brax = engine._train_brax
@@ -144,9 +215,9 @@ def _run_training_live(
         state["algorithm"] = "Brax PPO (GPU/JAX)"
         return _orig_brax(jrf, jdf, cb)
 
-    def _patched_sb3(rf=None, cb=None):
+    def _patched_sb3(rf=None, df=None, cb=None):
         state["algorithm"] = "SB3 PPO (CPU)"
-        return _orig_sb3(rf, cb)
+        return _orig_sb3(rf, df, cb)
 
     def _patched_random(cb=None):
         state["algorithm"] = "Random rollout (no learning)"
@@ -156,10 +227,26 @@ def _run_training_live(
     engine._train_sb3 = _patched_sb3
     engine._train_random_rollout = _patched_random
 
-    console.print(
-        f"\n[bold cyan]Robo Garden[/] — training [bold]{robot_name}[/] "
-        f"for [bold]{total_timesteps:,}[/] timesteps\n"
-    )
+    # Wire rollout streaming to the Isaac Sim bridge if connected.
+    from robo_garden.isaac import get_bridge as _get_bridge_live
+    _live_bridge = _get_bridge_live()
+    _merged_for_rollout = robot_path.read_text(encoding="utf-8")
+
+    def _rollout_cb(timestep: int, policy_apply) -> None:
+        if not _live_bridge.connected:
+            return
+        try:
+            from robo_garden.training.rollout import sample_rollout
+            rollout = sample_rollout(
+                _merged_for_rollout,
+                policy_apply,
+                num_frames=120,
+                seed=int(timestep) & 0xFFFF,
+            )
+            if rollout.qpos.shape[0] > 0:
+                _live_bridge.stream_qpos_batch(robot_name, rollout.qpos, list(rollout.timesteps))
+        except Exception as exc:
+            pass  # best-effort — never interrupt training for a rollout failure
 
     with Live(console=console, refresh_per_second=4, transient=False) as live:
         def _live_callback(step: int, metrics: dict) -> None:
@@ -169,9 +256,11 @@ def _run_training_live(
         result = engine.train(
             "",
             reward_fn=reward_fn,
+            done_fn=done_fn,
             jax_reward_fn=jax_reward_fn,
             jax_done_fn=jax_done_fn,
             callback=_live_callback,
+            rollout_callback=_rollout_cb if _live_bridge.connected else None,
         )
         engine.cleanup()
         live.update(_make_panel())
@@ -183,9 +272,34 @@ def _run_training_live(
         f"checkpoint=[dim]{result.checkpoint_path}[/]"
     )
 
+    # Write rollout frames so the Windows side can stream them to Isaac Sim.
+    # Only relevant when running as a WSL worker (wsl_run_id is set).
+    if wsl_run_id:
+        try:
+            import numpy as np
+            from robo_garden.config import WORKSPACE_DIR
+            from robo_garden.training.rollout import sample_rollout
+
+            job_dir = WORKSPACE_DIR / "_wsl_jobs" / wsl_run_id
+            job_dir.mkdir(parents=True, exist_ok=True)
+            rollout = sample_rollout(
+                robot_path.read_text(encoding="utf-8"),
+                None,  # zero-action rollout shows passive dynamics
+                num_frames=150,
+                seed=42,
+            )
+            if rollout.qpos.shape[0] > 0:
+                np.savez(
+                    str(job_dir / "rollout_frames.npz"),
+                    qpos=rollout.qpos,
+                    timesteps=np.array(rollout.timesteps),
+                )
+        except Exception as exc:
+            pass  # best-effort — don't crash training over a rollout write failure
+
 
 # ---------------------------------------------------------------------------
-# WSL2 launch (Windows → Linux GPU training)
+# WSL2 path helper (used by wsl_dispatch and _run_training_live)
 # ---------------------------------------------------------------------------
 
 def _windows_to_wsl_path(p: str) -> str:
@@ -196,54 +310,211 @@ def _windows_to_wsl_path(p: str) -> str:
     return p
 
 
-def _launch_wsl_training(robot_name: str, timesteps: int, num_envs: int) -> None:
-    """Run training inside WSL2, streaming output back to this terminal.
+def _run_wsl_worker(job_dir: Path) -> None:
+    """Linux-side worker: run a staged training job and write result.json.
 
-    Translates the Windows project path to its WSL2 ``/mnt/…`` equivalent,
-    then invokes ``wsl bash -c "…"`` as a subprocess so the Rich live display
-    renders inside the Windows Terminal.
+    Invoked as a subprocess by ``wsl_dispatch.run_in_wsl`` on the Windows
+    side.  Reads the job spec dumped into ``job_dir/job.json``, compiles
+    the reward function for both NumPy (SB3 fallback) and JAX (Brax GPU),
+    runs ``MuJoCoMJXEngine.train`` with real progress emission, and
+    finally persists a result dict to ``job_dir/result.json``.
+
+    All communication back to the Windows-side caller happens via:
+      * JSONL progress lines on stdout  (prefix ``__RG_PROGRESS__``)
+      * the final ``result.json`` file
+
+    Everything else printed goes to stdout verbatim and is passed through
+    to the Claude session's terminal, useful for dependency-import warnings
+    and real Python tracebacks.
     """
-    import subprocess
-    from robo_garden.config import PROJECT_ROOT
+    import time as _time
+    from robo_garden.training import wsl_dispatch
 
-    wsl_path = _windows_to_wsl_path(str(PROJECT_ROOT))
+    spec = wsl_dispatch.load_spec(job_dir)
 
-    # Source profile so uv / cargo-installed binaries are on PATH in the
-    # non-interactive shell that wsl.exe spawns.
-    source_profile = (
-        'source "$HOME/.profile" 2>/dev/null; '
-        'source "$HOME/.cargo/env" 2>/dev/null; '
-        'export PATH="$HOME/.local/bin:$PATH"; '
-    )
-    train_cmd = (
-        f'cd \'{wsl_path}\' && '
-        f'uv run robo-garden --no-isaac --mode train --robot {robot_name} '
-        f'--timesteps {timesteps} --envs {num_envs}'
-    )
+    # Rewrite Windows absolute paths (C:/... or C:\...) in MJCF XML to
+    # WSL equivalents (/mnt/c/...) so MuJoCo can open mesh/texture files
+    # from inside the Linux environment.
+    import re as _re
 
-    full_cmd = source_profile + train_cmd
-    print(f"Launching WSL2 training: {train_cmd}\n")
+    def _rewire_xml_paths(xml: str) -> str:
+        return _re.sub(
+            r'([A-Za-z]):[/\\]([^"\'<>\s]+)',
+            lambda m: f"/mnt/{m.group(1).lower()}/{m.group(2).replace(chr(92), '/')}",
+            xml,
+        )
+
+    spec.robot_xml = _rewire_xml_paths(spec.robot_xml)
+    spec.env_mjcf = _rewire_xml_paths(spec.env_mjcf)
+
+    print(f"WSL worker starting (run_id={spec.run_id}, "
+          f"robot={spec.robot_name}, envs={spec.num_envs}, "
+          f"timesteps={spec.total_timesteps:,})", flush=True)
+
+    error_text = ""
+    success = False
+    best_reward = float("-inf")
+    reward_curve: list[tuple[int, float]] = []
+    checkpoint_path = ""
+    started_at = _time.time()
 
     try:
-        proc = subprocess.Popen(
-            ["wsl", "bash", "-c", full_cmd],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+        from robo_garden.training.mujoco_engine import MuJoCoMJXEngine
+        from robo_garden.training.models import TrainingConfig
+
+        # Probe the actual observation / action dimensions from the robot
+        # MJCF so the reward smoke-tests and JIT traces use real shapes.
+        # Claude-generated rewards routinely include a defensive
+        # ``if len(obs) < N: raise ValueError(...)`` — tracing that against
+        # a 10-wide stand-in always fails and we'd wrongly disable the
+        # Brax GPU path.
+        obs_dim: int | None = None
+        action_dim: int | None = None
+        try:
+            import mujoco as _mj
+            _probe = _mj.MjModel.from_xml_string(spec.robot_xml)
+            obs_dim = int(_probe.nq + _probe.nv)
+            action_dim = int(_probe.nu)
+            print(f"Probed MJCF dims: obs_dim={obs_dim}, action_dim={action_dim}", flush=True)
+        except Exception as exc:
+            print(f"WARN: could not probe MJCF dims ({exc}); smoke-testing "
+                  f"with stand-in shapes (obs=10, action=4)", flush=True)
+
+        # Compile Claude's reward source into a NumPy callable (for the SB3
+        # fallback) and, best-effort, a JAX callable (unlocks the Brax/GPU
+        # path). The JAX compile is allowed to fail — we just lose GPU.
+        numpy_reward_fn = None
+        jax_reward_fn = None
+        if spec.reward_fn_code:
+            try:
+                from robo_garden.rewards.reward_runner import (
+                    compile_reward_function,
+                    safe_reward,
+                )
+                _np_raw = compile_reward_function(
+                    spec.reward_fn_code,
+                    obs_dim=obs_dim,
+                    action_dim=action_dim,
+                )
+                _np_safe = safe_reward(_np_raw, fallback=0.0)
+                numpy_reward_fn = (
+                    lambda obs, action, next_obs, _r=_np_safe:
+                        float(_r(obs, action, next_obs, {})[0])
+                )
+            except Exception as exc:
+                print(f"WARN: NumPy reward compile failed: {exc}", flush=True)
+
+            try:
+                from robo_garden.rewards.reward_runner import (
+                    compile_jax_reward_function,
+                )
+                jax_reward_fn = compile_jax_reward_function(
+                    spec.reward_fn_code,
+                    obs_dim=obs_dim,
+                    action_dim=action_dim,
+                )
+                print("JAX reward traced successfully; Brax/GPU path enabled.", flush=True)
+            except Exception as exc:
+                print(
+                    f"NOTE: reward not JAX-traceable ({exc}); falling back to "
+                    f"SB3/CPU. To use the Brax GPU path, rewrite the reward to "
+                    f"use only numpy ops that jax.numpy supports and avoid "
+                    f"Python-level 'if' on obs values (use jnp.where instead).",
+                    flush=True,
+                )
+
+        config = TrainingConfig(
+            algorithm=spec.algorithm,
+            num_envs=spec.num_envs,
+            total_timesteps=spec.total_timesteps,
+            max_episode_steps=spec.max_episode_steps,
         )
-    except FileNotFoundError:
-        print("Error: wsl.exe not found. Is WSL2 installed?")
-        print("Install it with:  wsl --install -d Ubuntu-22.04")
-        sys.exit(1)
 
-    for line in proc.stdout:
-        print(line, end="", flush=True)
+        engine = MuJoCoMJXEngine()
+        engine.setup(spec.robot_xml, spec.env_mjcf, config)
 
-    proc.wait()
-    if proc.returncode != 0:
-        sys.exit(proc.returncode)
+        def _progress(step: int, metrics: dict) -> None:
+            nonlocal best_reward
+            mean_r = float(metrics.get("eval/episode_reward", metrics.get("mean_reward", 0.0)))
+            if mean_r > best_reward:
+                best_reward = mean_r
+            reward_curve.append((int(step), mean_r))
+            emit_payload: dict = {
+                "eval/episode_reward": mean_r,
+                "mean_reward": mean_r,
+                "best_reward": best_reward,
+                "elapsed_s": _time.time() - started_at,
+                "total_timesteps": config.total_timesteps,
+            }
+            if "_backend" in metrics:
+                emit_payload["_backend"] = metrics["_backend"]
+            wsl_dispatch.emit_progress(step, emit_payload)
+
+        result = engine.train(
+            reward_fn_code=spec.reward_fn_code,
+            reward_fn=numpy_reward_fn,
+            jax_reward_fn=jax_reward_fn,
+            callback=_progress,
+        )
+        engine.cleanup()
+
+        success = True
+        best_reward = float(result.best_reward)
+        reward_curve = list(result.reward_curve)
+        checkpoint_path = str(result.checkpoint_path)
+    except Exception as exc:
+        import traceback
+        error_text = f"{type(exc).__name__}: {exc}"
+        print(f"WSL worker FAILED: {error_text}", flush=True)
+        traceback.print_exc()
+
+    ended_at = _time.time()
+
+    # Generate a short rollout for post-training viewport playback on Windows.
+    # Brax/JAX trained policies can't be easily reconstructed outside the
+    # training context (inference fn not serialized), so we run a zero-action
+    # rollout — this at least shows the robot's passive stability and joint
+    # layout, confirming the physics are sane.
+    rollout_frames_path = ""
+    if success and spec.robot_xml:
+        try:
+            from robo_garden.training.rollout import sample_rollout
+            from robo_garden.training.mujoco_engine import _merge_mjcf
+
+            merged_for_rollout = _merge_mjcf(spec.robot_xml, spec.env_mjcf)
+            rollout = sample_rollout(
+                merged_for_rollout,
+                None,  # zero-action policy — Brax params not serializable here
+                num_frames=150,
+                seed=42,
+            )
+            if rollout.qpos.shape[0] > 0:
+                frames_path = job_dir / "rollout_frames.npz"
+                np.savez(
+                    str(frames_path),
+                    qpos=rollout.qpos,
+                    timesteps=np.array(rollout.timesteps, dtype=np.float32),
+                )
+                rollout_frames_path = str(frames_path)
+                print(f"Rollout frames saved ({len(rollout.qpos)} frames)", flush=True)
+        except Exception as exc:
+            print(f"WARN: could not generate rollout frames: {exc}", flush=True)
+
+    wsl_dispatch.write_result(job_dir, {
+        "success": success,
+        "best_reward": best_reward,
+        "reward_curve": reward_curve,
+        "checkpoint_path": checkpoint_path,
+        "training_time_seconds": ended_at - started_at,
+        "error": error_text,
+        "rollout_frames_path": rollout_frames_path,
+    })
+    print(
+        f"WSL worker finished "
+        f"(success={success}, best_reward={best_reward:.3f}, "
+        f"time={ended_at - started_at:.1f}s)",
+        flush=True,
+    )
 
 
 def _run_gym(args) -> None:
@@ -322,7 +593,9 @@ def _run_gym(args) -> None:
             f"({robot_path!r}); viewport will be empty."
         )
 
-    session = Session(phase="training", enable_viewer=False)
+    from robo_garden.studio import _build_training_context
+    _gym_context = _build_training_context(args.timesteps, args.envs)
+    session = Session(phase="training", enable_viewer=False, extra_context=_gym_context)
     session.approved_robot = robot_name
     session.approved_environment = env_name
 
@@ -568,6 +841,23 @@ def main():
         ),
     )
     parser.add_argument(
+        "--wsl-worker",
+        metavar="JOB_DIR",
+        help=(
+            "INTERNAL. Linux-side training worker for Claude-driven runs "
+            "dispatched via ROBO_GARDEN_TRAIN_IN_WSL; reads job.json from "
+            "JOB_DIR and writes result.json when done."
+        ),
+    )
+    parser.add_argument(
+        "--wsl-run-id",
+        metavar="RUN_ID",
+        help=(
+            "INTERNAL. Run ID for this training session; the Linux worker "
+            "writes rollout_frames.npz to workspace/_wsl_jobs/<RUN_ID>/."
+        ),
+    )
+    parser.add_argument(
         "--prompt-file",
         metavar="FILE",
         help="Send file contents as the opening message (relative paths resolve from workspace/prompts/)",
@@ -588,7 +878,7 @@ def main():
         not args.no_isaac
         and not args.no_auto_isaac
         and ISAAC_BRIDGE_ENABLED != "off"
-        and args.mode in ("studio", "gym")
+        and args.mode in ("studio", "gym", "train")
     ):
         _ensure_isaac_server_running(
             ISAAC_BRIDGE_URL,
@@ -626,19 +916,26 @@ def main():
             except FileNotFoundError as exc:
                 print(f"Error: {exc}")
                 sys.exit(1)
-        run_studio(isaac_url=ISAAC_BRIDGE_URL, initial_prompt=seed)
+        run_studio(
+            isaac_url=ISAAC_BRIDGE_URL,
+            initial_prompt=seed,
+            training_timesteps=args.timesteps,
+            training_num_envs=args.envs,
+        )
     elif args.mode == "gym":
         _run_gym(args)
     elif args.mode == "train":
+        # Internal: Linux-side worker for Claude-driven gym-mode runs.
+        # Branches *before* the --robot check because the worker takes its
+        # robot/env/reward directly from job.json instead of CLI flags.
+        if args.wsl_worker:
+            _run_wsl_worker(Path(args.wsl_worker))
+            return
+
         robot_name = args.robot
         if not robot_name:
             print("Error: --mode train requires --robot <name>")
             sys.exit(1)
-
-        # --wsl: delegate to WSL2 and stream output back (Windows only)
-        if args.wsl:
-            _launch_wsl_training(robot_name, args.timesteps, args.envs)
-            return
 
         from robo_garden.config import ROBOTS_DIR
 
@@ -649,10 +946,24 @@ def main():
             print(f"Error: robot '{robot_name}' not found in workspace. Generate it first.")
             sys.exit(1)
 
-        # Built-in reward functions for known robots
+        # Load robot into Isaac Sim viewport before training starts so the
+        # user can see the robot and watch rollout frames stream in.
+        from robo_garden.isaac import get_bridge as _get_bridge
+        _train_bridge = _get_bridge()
+        if _train_bridge.connected:
+            fmt = "urdf" if str(robot_path).endswith(".urdf") else "mjcf"
+            _train_bridge.send_robot(robot_name, robot_path, fmt=fmt)
+
+        # Built-in reward functions for known robots.  Without one of these
+        # (and no Claude-generated reward in this mode), MJXBraxEnv falls
+        # back to a pure control-effort penalty whose optimum is ``action=0``
+        # → robot collapses. See brax_env.py for the default.
+        from robo_garden.training.gym_env import BUILTIN_REWARD_SOURCE
         reward_fn = None
+        done_fn = None
         jax_reward_fn = None
         jax_done_fn = None
+        locomotion_horizon = None
         if robot_name == "cartpole":
             from robo_garden.training.gym_env import (
                 cartpole_reward,
@@ -662,6 +973,39 @@ def main():
             reward_fn = cartpole_reward
             jax_reward_fn = cartpole_reward_jax
             jax_done_fn = cartpole_done_jax
+        elif robot_name == "go2_walker":
+            from robo_garden.training.gym_env import (
+                go2_walker_reward,
+                go2_walker_done,
+                go2_walker_reward_jax,
+                go2_walker_done_jax,
+            )
+            reward_fn = go2_walker_reward
+            done_fn = go2_walker_done
+            jax_reward_fn = go2_walker_reward_jax
+            jax_done_fn = go2_walker_done_jax
+            # Locomotion needs multi-second episodes for a gait to emerge; 500
+            # steps × dt=0.002 = 1 s is too short for walking policies.  5 s
+            # gives the policy time to push the trunk forward several body
+            # lengths before truncation.
+            locomotion_horizon = 2500
+
+        # ``--approved`` is consumed by --mode gym; in --mode train we only use
+        # it as a context string for logging so users are not silently confused
+        # when they pass it and it has no effect on the reward function.
+        if getattr(args, "approved", None):
+            print(
+                f"Note: --approved '{args.approved}' is informational in "
+                f"--mode train; reward function comes from the built-in "
+                f"for robot '{robot_name}'."
+            )
+
+        # Auto-detect WSL2 GPU availability.  --wsl forces it; without it,
+        # wsl_dispatch.is_enabled() checks for wsl.exe + Ubuntu-22.04 and
+        # returns True automatically when WSL2 is set up.  No explicit --wsl
+        # flag needed — GPU is preferred whenever it's available.
+        from robo_garden.training import wsl_dispatch as _wsl
+        _use_wsl = bool(args.wsl) or _wsl.is_enabled()
 
         _run_training_live(
             robot_name,
@@ -669,8 +1013,13 @@ def main():
             args.timesteps,
             args.envs,
             reward_fn=reward_fn,
+            done_fn=done_fn,
             jax_reward_fn=jax_reward_fn,
             jax_done_fn=jax_done_fn,
+            max_episode_steps=locomotion_horizon,
+            wsl_run_id=getattr(args, "wsl_run_id", None),
+            reward_fn_code=BUILTIN_REWARD_SOURCE.get(robot_name, ""),
+            use_wsl=_use_wsl,
         )
 
 

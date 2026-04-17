@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
 import time
 
 import numpy as np
@@ -11,6 +13,13 @@ from robo_garden.training.models import CurriculumConfig, TrainingConfig, Traini
 from robo_garden.training.vectorized_env import MJXVectorizedEnv
 
 log = logging.getLogger(__name__)
+
+# How long to wait for the first Brax progress tick before giving up and
+# falling back to SB3.  Covers both mjx.put_model upload time and the XLA
+# compilation of the full PPO loop.  Override with ROBO_GARDEN_BRAX_TIMEOUT.
+_BRAX_COMPILE_TIMEOUT_S: int = int(os.getenv("ROBO_GARDEN_BRAX_TIMEOUT", "3600"))
+_BRAX_HEARTBEAT_INTERVAL_S: int = 30
+_BRAX_MIN_ENVS: int = 64
 
 
 def _merge_mjcf(robot_mjcf: str, env_mjcf: str) -> str:
@@ -140,6 +149,7 @@ class MuJoCoMJXEngine:
         reward_fn=None,
         jax_reward_fn=None,
         jax_done_fn=None,
+        done_fn=None,
         callback=None,
         rollout_callback=None,
     ) -> TrainingResult:
@@ -166,6 +176,7 @@ class MuJoCoMJXEngine:
 
         # Stash for use by per-algorithm _train_* methods
         self._rollout_callback = rollout_callback
+        self._done_fn = done_fn
 
         # Compile NumPy reward from source if no pre-built one supplied
         if reward_fn is None and reward_fn_code:
@@ -175,9 +186,8 @@ class MuJoCoMJXEngine:
                     safe_reward,
                 )
                 _compute = safe_reward(compile_reward_function(reward_fn_code))
-                reward_fn = lambda obs, action, next_obs: float(
-                    _compute(obs, action, next_obs, {})[0]
-                )
+                # Return the (scalar, components) tuple so MuJoCoGymEnv can capture components
+                reward_fn = lambda obs, action, next_obs: _compute(obs, action, next_obs, {})
             except Exception as e:
                 log.warning(f"Reward function compilation failed ({e}), using default reward")
 
@@ -198,7 +208,7 @@ class MuJoCoMJXEngine:
                 log.warning(f"Brax PPO unavailable ({e}), trying SB3 PPO on CPU")
 
         try:
-            return self._train_sb3(reward_fn, callback)
+            return self._train_sb3(reward_fn, getattr(self, "_done_fn", None), callback)
         except Exception as e:
             log.warning(f"SB3 PPO failed ({e}), running random-rollout baseline")
             return self._train_random_rollout(callback)
@@ -209,10 +219,18 @@ class MuJoCoMJXEngine:
         Uses ``MJXBraxEnv`` which operates entirely in JAX so both the physics
         step and the reward function are JIT-compiled and run on the GPU.
 
-        Raises RuntimeError if JAX GPU / Brax / mujoco-mjx are not available.
+        Raises RuntimeError if JAX GPU / Brax / mujoco-mjx are not available,
+        or if the first progress tick does not arrive within
+        ``_BRAX_COMPILE_TIMEOUT_S`` seconds (falls back to SB3).
         """
         import jax
-        from brax.training.agents.ppo import train as ppo_train  # type: ignore
+        # Brax >= 0.14 turned ``brax.training.agents.ppo.train`` from a function
+        # into a submodule (you now have to import the inner ``train`` function
+        # explicitly). Try the new path first, fall back to the legacy one.
+        try:
+            from brax.training.agents.ppo.train import train as ppo_train  # type: ignore
+        except ImportError:
+            from brax.training.agents.ppo import train as ppo_train  # type: ignore
         from robo_garden.training.brax_env import MJXBraxEnv
 
         # Fail fast if JAX is on CPU — Brax GPU training would be unusably slow
@@ -224,36 +242,141 @@ class MuJoCoMJXEngine:
             )
 
         config = self.config
+
+        if config.num_envs < _BRAX_MIN_ENVS:
+            log.warning(
+                f"num_envs={config.num_envs} is very low for Brax GPU training "
+                f"(recommended ≥{_BRAX_MIN_ENVS}). GPU utilization will be negligible "
+                f"and JIT overhead won't be amortized. Pass --envs 128 or higher."
+            )
+            if callback:
+                callback(0, {
+                    "eval/episode_reward": 0.0,
+                    "_backend": (
+                        f"Brax PPO / GPU ({backend}) — WARNING: only {config.num_envs} envs "
+                        f"(recommended ≥{_BRAX_MIN_ENVS}). Training anyway..."
+                    ),
+                })
+
+        # Notify BEFORE model upload so the UI shows something immediately.
+        log.info(
+            f"Brax PPO starting on {backend.upper()} — uploading model to VRAM "
+            f"({config.num_envs} envs, {config.total_timesteps:,} timesteps)."
+        )
+        if callback:
+            callback(0, {
+                "eval/episode_reward": 0.0,
+                "_backend": f"Brax PPO / GPU ({backend}) — loading model to VRAM...",
+            })
+
         adapter = MJXBraxEnv(
             mjcf_xml=self._merged_mjcf,
             reward_fn=jax_reward_fn,
             done_fn=jax_done_fn,
         )
 
+        # Notify that model upload is done and JIT compilation is starting.
+        # First real progress tick won't arrive until the entire PPO loop is
+        # compiled, which takes 1-5 min on first run for complex robots.
+        log.info(
+            f"Model on {backend.upper()} — JIT compiling Brax PPO loop. "
+            f"First progress update after compilation (~1-5 min on cold XLA cache)."
+        )
+        if callback:
+            callback(0, {
+                "eval/episode_reward": 0.0,
+                "_backend": f"Brax PPO / GPU ({backend}) — JIT compiling...",
+            })
+
         start = time.time()
         reward_curve: list[tuple[int, float]] = []
+
+        # Threading event set by the first progress tick. Used by the timeout
+        # watchdog on the main thread to detect a hung JIT compilation.
+        _first_tick = threading.Event()
+        _shared: dict = {"result": None, "exc": None}
 
         def _progress(step, metrics):
             r = float(metrics.get("eval/episode_reward", 0.0))
             reward_curve.append((step, r))
             log.info(f"  step={step:,}  mean_reward={r:.3f}  [Brax PPO / {backend}]")
+            if not _first_tick.is_set():
+                _first_tick.set()
             if callback:
-                callback(step, metrics)
+                callback(step, {**metrics, "_backend": f"Brax PPO / GPU ({backend})"})
 
-        make_inference_fn, params, _ = ppo_train(
-            environment=adapter,
-            num_timesteps=config.total_timesteps,
-            episode_length=config.max_episode_steps,
-            num_envs=config.num_envs,
-            learning_rate=config.learning_rate,
-            entropy_cost=config.entropy_coef,
-            discounting=config.gamma,
-            batch_size=config.batch_size,
-            progress_fn=_progress,
-        )
+        def _run_ppo():
+            try:
+                make_fn, params, _ = ppo_train(
+                    environment=adapter,
+                    num_timesteps=config.total_timesteps,
+                    episode_length=config.max_episode_steps,
+                    num_envs=config.num_envs,
+                    learning_rate=config.learning_rate,
+                    entropy_cost=config.entropy_coef,
+                    discounting=config.gamma,
+                    batch_size=config.batch_size,
+                    progress_fn=_progress,
+                )
+                _shared["result"] = (make_fn, params)
+            except Exception as exc:
+                _shared["exc"] = exc
+            finally:
+                _first_tick.set()  # unblock watchdog even on failure
+
+        thread = threading.Thread(target=_run_ppo, daemon=True)
+        thread.start()
+
+        # Wait for the first progress tick (signals JIT done + training running).
+        # Extend the deadline automatically as long as the thread is alive — a
+        # cold XLA cache on Go2 can take 10-15 min and the thread stays alive the
+        # whole time. _BRAX_COMPILE_TIMEOUT_S is the absolute ceiling for a truly
+        # hung process (CUDA driver crash, OOM that doesn't surface as an exception).
+        absolute_deadline = time.time() + _BRAX_COMPILE_TIMEOUT_S
+        while not _first_tick.is_set():
+            # Thread died with an exception — surface it immediately.
+            if _shared["exc"] is not None:
+                raise _shared["exc"]
+
+            elapsed_so_far = time.time() - start
+
+            # Thread exited without a tick and without an exception — shouldn't
+            # happen (finally block sets _first_tick), but guard anyway.
+            if not thread.is_alive():
+                raise RuntimeError(
+                    f"Brax PPO thread exited after {elapsed_so_far:.0f}s without "
+                    "producing a progress tick. Check logs for XLA/CUDA errors."
+                )
+
+            # Thread is alive — keep waiting with a heartbeat callback.
+            # The absolute deadline below is only a last-resort guard for a truly
+            # deadlocked process; a slow-but-live XLA compilation never hits it.
+            m, s = divmod(int(elapsed_so_far), 60)
+            if callback:
+                callback(0, {
+                    "eval/episode_reward": 0.0,
+                    "_backend": f"Brax PPO / GPU ({backend}) — JIT compiling ({m}m {s:02d}s elapsed)...",
+                })
+
+            if time.time() > absolute_deadline:
+                raise RuntimeError(
+                    f"Brax PPO JIT compilation exceeded {_BRAX_COMPILE_TIMEOUT_S / 3600:.1f}h "
+                    f"with thread still alive — XLA appears deadlocked. Falling back to SB3 PPO. "
+                    f"Override with ROBO_GARDEN_BRAX_TIMEOUT=<seconds>."
+                )
+
+            _first_tick.wait(timeout=_BRAX_HEARTBEAT_INTERVAL_S)
+
+        # JIT succeeded — wait for the training thread to finish.
+        thread.join()
+
+        if _shared["exc"] is not None:
+            raise _shared["exc"]
 
         elapsed = time.time() - start
         best_reward = max((r for _, r in reward_curve), default=float("-inf"))
+
+        _, params = _shared["result"]
 
         from robo_garden.training.checkpoints import save_checkpoint
         from robo_garden.config import CHECKPOINTS_DIR
@@ -265,6 +388,10 @@ class MuJoCoMJXEngine:
             "total_timesteps": config.total_timesteps,
             "best_reward": best_reward,
             "num_envs": config.num_envs,
+            # obs_size / action_size are saved so inference.py can reconstruct
+            # make_inference_fn without re-running the training loop.
+            "obs_size": int(adapter.observation_size),
+            "action_size": int(adapter.action_size),
         })
 
         return TrainingResult(
@@ -275,7 +402,7 @@ class MuJoCoMJXEngine:
             checkpoint_path=checkpoint_dir,
         )
 
-    def _train_sb3(self, reward_fn=None, callback=None) -> TrainingResult:
+    def _train_sb3(self, reward_fn=None, done_fn=None, callback=None) -> TrainingResult:
         """Train with stable-baselines3 PPO (CPU, single env). Used when MJX/Brax unavailable."""
         import time
         import numpy as np
@@ -290,6 +417,7 @@ class MuJoCoMJXEngine:
             mjcf_xml=self._merged_mjcf,
             max_episode_steps=config.max_episode_steps,
             reward_fn=reward_fn,
+            done_fn=done_fn,
         )
         # VecMonitor injects info["episode"] on episode end so the callback
         # can track cumulative episode rewards without a separate Monitor wrapper.
@@ -321,7 +449,15 @@ class MuJoCoMJXEngine:
                     reward_curve.append((self.num_timesteps, mean_r))
                     log.info(f"  step={self.num_timesteps:,}  mean_ep_reward={mean_r:.3f}  (SB3 PPO)")
                     if callback:
-                        callback(self.num_timesteps, {"eval/episode_reward": mean_r})
+                        metrics: dict = {"eval/episode_reward": mean_r, "_backend": "SB3 PPO (CPU)"}
+                        try:
+                            inner = self.training_env.venv.envs[0]
+                            comps = getattr(inner, "last_reward_components", {})
+                            if comps:
+                                metrics["components"] = dict(comps)
+                        except Exception:
+                            pass
+                        callback(self.num_timesteps, metrics)
 
                     if (
                         rollout_cb is not None
@@ -420,7 +556,7 @@ class MuJoCoMJXEngine:
                 reward_curve.append((total_steps, mean_r))
                 log.info(f"  step={total_steps:,}  mean_ep_reward={mean_r:.3f}  (random policy)")
                 if callback:
-                    callback(total_steps, {"eval/episode_reward": mean_r})
+                    callback(total_steps, {"eval/episode_reward": mean_r, "_backend": "Random rollout (no learning)"})
                 rollout_cb = getattr(self, "_rollout_callback", None)
                 if rollout_cb is not None:
                     # No trained policy yet — let the caller fall back to a
@@ -466,34 +602,54 @@ class MuJoCoMJXEngine:
     def evaluate(self, checkpoint_path: str, num_episodes: int = 10) -> dict:
         """Evaluate policy by running rollout episodes.
 
-        Loads checkpoint if available; falls back to random policy baseline.
-        Returns reward statistics over num_episodes.
+        For SB3 checkpoints loads the saved policy; falls back to random baseline
+        when the checkpoint type is unsupported (e.g. Brax JAX params).
         """
         import numpy as np
         import mujoco
-        from robo_garden.training.checkpoints import load_checkpoint
-
-        policy = "random_baseline"
-        if checkpoint_path:
-            try:
-                load_checkpoint(checkpoint_path)
-                policy = "checkpoint"
-            except Exception as e:
-                log.warning(f"Could not load checkpoint ({e}), using random baseline")
+        from pathlib import Path
 
         if not self._merged_mjcf:
             return {"error": "Engine not set up. Call setup() before evaluate()."}
 
         model = mujoco.MjModel.from_xml_string(self._merged_mjcf)
         max_steps = self.config.max_episode_steps if self.config else 1000
-        episode_rewards: list[float] = []
 
+        policy = "random_baseline"
+        policy_fn = None
+
+        if checkpoint_path:
+            policy_zip = Path(checkpoint_path) / "policy.zip"
+            if policy_zip.exists():
+                try:
+                    from stable_baselines3 import PPO
+                    sb3_model = PPO.load(str(policy_zip), device="cpu")
+                    policy = "sb3_checkpoint"
+
+                    def policy_fn(obs, _m=sb3_model):
+                        action, _ = _m.predict(obs, deterministic=True)
+                        return np.asarray(action, dtype=np.float32).reshape(-1)
+
+                except Exception as exc:
+                    log.warning(f"Could not load SB3 policy ({exc}), using random baseline")
+            else:
+                log.debug(
+                    f"No policy.zip at {checkpoint_path} — Brax/JAX params cannot be "
+                    "evaluated without the inference function. Using random baseline."
+                )
+
+        episode_rewards: list[float] = []
         for ep in range(num_episodes):
             data = mujoco.MjData(model)
             mujoco.mj_resetData(model, data)
             ep_reward = 0.0
             for _ in range(max_steps):
-                data.ctrl[:] = np.random.uniform(-1, 1, model.nu).astype(np.float32)
+                if policy_fn is not None:
+                    obs = np.concatenate([data.qpos, data.qvel]).astype(np.float32)
+                    ctrl = policy_fn(obs)[:model.nu]
+                else:
+                    ctrl = np.random.uniform(-1, 1, model.nu).astype(np.float32)
+                data.ctrl[:] = ctrl
                 mujoco.mj_step(model, data)
                 ep_reward += float(-0.01 * np.sum(np.square(data.ctrl)))
             episode_rewards.append(ep_reward)
@@ -508,6 +664,50 @@ class MuJoCoMJXEngine:
             "min_reward": float(arr.min()),
             "max_reward": float(arr.max()),
         }
+
+    def rollout_from_checkpoint(
+        self,
+        checkpoint_path: str,
+        num_frames: int = 150,
+        seed: int = 0,
+    ) -> "Rollout | None":
+        """Load a checkpoint and run a policy rollout for viewport/video playback.
+
+        For SB3 checkpoints the saved policy is used.  For Brax/JAX checkpoints
+        (which require the inference function that only exists during training)
+        a zero-action rollout is returned so the caller still gets valid frames.
+        """
+        from pathlib import Path
+        from robo_garden.training.rollout import Rollout, sample_rollout
+
+        if not self._merged_mjcf:
+            return None
+
+        import numpy as np
+
+        policy_fn = None
+        policy_zip = Path(checkpoint_path) / "policy.zip"
+        if policy_zip.exists():
+            try:
+                from stable_baselines3 import PPO
+                sb3_model = PPO.load(str(policy_zip), device="cpu")
+
+                def policy_fn(obs, _m=sb3_model):
+                    action, _ = _m.predict(obs, deterministic=True)
+                    return np.asarray(action, dtype=np.float32).reshape(-1)
+
+            except Exception as exc:
+                log.warning(
+                    f"Could not load SB3 policy for rollout ({exc}); "
+                    "using zero-action policy instead."
+                )
+
+        return sample_rollout(
+            self._merged_mjcf,
+            policy_fn,
+            num_frames=num_frames,
+            seed=seed,
+        )
 
     def cleanup(self) -> None:
         if self._env:

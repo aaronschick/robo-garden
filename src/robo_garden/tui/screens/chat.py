@@ -35,6 +35,12 @@ class ChatScreen(Widget):
         super().__init__()
         self._session = None
         self._reward_iteration = 0
+        # Maps reward_function_id -> iteration index so training results can
+        # back-fill the 0.0/0.0 placeholders in RewardsScreen.
+        self._reward_id_to_iter: dict[str, int] = {}
+        # Last reward_function_id seen from generate_reward (used when train
+        # result arrives without an explicit reward_function_id).
+        self._last_reward_id: str = ""
 
     def compose(self) -> ComposeResult:
         yield RichLog(id="log", wrap=True, markup=True, highlight=False)
@@ -81,6 +87,8 @@ class ChatScreen(Widget):
                 from robo_garden.tui.screens.rewards import RewardsScreen
                 self._reward_iteration += 1
                 reward_id = result.get("reward_function_id", "?")
+                self._last_reward_id = reward_id
+                self._reward_id_to_iter[reward_id] = self._reward_iteration
                 self.app.call_from_thread(
                     self.app.query_one(RewardsScreen).add_iteration,
                     self._reward_iteration,
@@ -88,16 +96,39 @@ class ChatScreen(Widget):
                     0.0,
                     result.get("task_description", reward_id),
                 )
-            elif name == "train" and result.get("success"):
+            elif name == "train":
                 from robo_garden.tui.screens.training import TrainingScreen
-                reward_curve = result.get("reward_curve", [])
-                for step, mean_r in reward_curve:
-                    self.app.call_from_thread(
-                        self.app.query_one(TrainingScreen).log_update,
-                        step,
-                        {"eval/episode_reward": mean_r},
-                    )
+                # Live progress already streamed by the TUI callback; the
+                # reward_curve in the result is a post-run summary — skip
+                # replaying it to avoid duplicating lines already shown.
+                if result.get("success"):
+                    best = result.get("best_reward")
+                    if best is not None:
+                        # Back-fill the reward in RewardsScreen if this run
+                        # was triggered after a generate_reward call.
+                        rfn_id = result.get("reward_function_id", self._last_reward_id)
+                        iteration = self._reward_id_to_iter.get(rfn_id)
+                        if iteration is not None and best > 0:
+                            from robo_garden.tui.screens.rewards import RewardsScreen
+                            self.app.call_from_thread(
+                                self.app.query_one(RewardsScreen).update_best_reward,
+                                iteration,
+                                float(best),
+                            )
 
+        # Register a live-training sink so TrainingScreen updates in real-time
+        # rather than only after training completes.
+        from robo_garden.claude import tool_handlers
+        from robo_garden.tui.screens.training import TrainingScreen
+
+        def _tui_progress(step: int, metrics: dict) -> None:
+            self.app.call_from_thread(
+                self.app.query_one(TrainingScreen).log_update,
+                step,
+                metrics,
+            )
+
+        tool_handlers.set_tui_train_progress(_tui_progress)
         try:
             response = await asyncio.to_thread(
                 session.chat, message, on_tool_call=on_tool_call, on_tool_result=on_tool_result
@@ -105,6 +136,8 @@ class ChatScreen(Widget):
         except Exception as e:
             log.write(f"[bold red]Error:[/bold red] {e}")
             return
+        finally:
+            tool_handlers.set_tui_train_progress(None)
 
         for line in tool_lines:
             log.write(line)

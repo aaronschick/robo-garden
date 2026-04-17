@@ -6,16 +6,27 @@ readme = "README.md"
 authors = [
     { name = "Aaron Schick", email = "aaron.c.schick1@gmail.com" }
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "mujoco>=3.2.0",
     "mujoco-mjx>=3.2.0; sys_platform == 'linux'",
-    "jax[cuda12]>=0.4.30; sys_platform == 'linux'",
-    "jax>=0.4.30; sys_platform != 'linux'",
+    # JAX 0.9 removed jax.device_put_replicated (it was deprecated in 0.8.1).
+    # Brax 0.14.x still calls it internally during PPO training, so we need
+    # jax 0.8.x until brax ships a release that uses jax.device_put with
+    # NamedSharding. Cap jaxlib too so they stay version-aligned.
+    "jax[cuda12]>=0.4.30,<0.9; sys_platform == 'linux'",
+    "jaxlib<0.9; sys_platform == 'linux'",
+    "jax>=0.4.30,<0.9; sys_platform != 'linux'",
     "anthropic>=0.40.0",
     "brax>=0.12.0; sys_platform == 'linux'",
     "gymnasium>=1.0.0",
     "gymnasium-robotics>=1.3.0",
+    # Note: torch 2.10/2.11 wheels on Linux PyPI have an NCCL ABI mismatch
+    # (libtorch_cuda.so: undefined symbol: ncclDevCommDestroy), but only the
+    # SB3 fallback path imports torch — Brax PPO (the primary WSL2/GPU path)
+    # uses JAX. We deliberately accept the latest torch so JAX's cuDNN
+    # version constraints are satisfied. If you need torch on Linux, do an
+    # explicit downgrade in your venv: `uv pip install 'torch<2.10'`.
     "torch>=2.3",
     "stable-baselines3>=2.4.0",
     "textual>=1.0.0",
@@ -26,6 +37,7 @@ dependencies = [
     "robot-descriptions>=1.12.0",
     "websockets>=12.0",
     "imageio[ffmpeg]>=2.0",
+    "pygame>=2.5.0",
 ]
 
 [project.optional-dependencies]
@@ -42,6 +54,7 @@ cloud = [
 
 [project.scripts]
 robo-garden = "robo_garden.cli:main"
+robo-garden-app = "robo_garden.app:main"
 
 [build-system]
 requires = ["uv_build>=0.10.9"]

@@ -169,7 +169,17 @@ TOOLS = [
             "\n"
             "If you reference any index, assert it fits nq/nv/nu first. A safe-\n"
             "guard wrapper returns 0.0 on IndexError during training, but the\n"
-            "smoke test raises — so fix layout bugs here."
+            "smoke test raises — so fix layout bugs here.\n"
+            "\n"
+            "GPU-TRAINING CAVEAT: when the training backend is JAX/Brax (GPU),\n"
+            "the reward is JIT-traced. Python-level 'if' / 'elif' / 'else'\n"
+            "that branches on observation or action values cannot trace and\n"
+            "forces a fallback to CPU SB3, losing ~20-50x throughput. Prefer\n"
+            "np.where(cond, a, b) over 'if cond: x = a else: x = b' anywhere\n"
+            "the condition depends on obs/action/next_obs. Simple symmetric\n"
+            "'if a < b: x = p else: x = q' blocks are auto-rewritten for you,\n"
+            "but anything more complex (multi-statement branches, mutation,\n"
+            "early return) stays Python and blocks the GPU path."
         ),
         "input_schema": {
             "type": "object",
@@ -328,6 +338,81 @@ TOOLS = [
                 },
             },
             "required": ["robot_name", "environment_name"],
+        },
+    },
+    {
+        "name": "review_run",
+        "description": (
+            "Load a completed training run by its run_id, replay the policy in the Isaac Sim "
+            "viewport, and optionally save an MP4 video of the rollout to workspace/renders/. "
+            "Use this after a training run finishes to review what the robot learned. "
+            "Pass run_id='latest' to replay the most recent successful run. "
+            "For SB3/CPU-trained policies the actual learned policy is used; for Brax/GPU "
+            "runs a zero-action rollout is shown (Brax inference loading not yet wired)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "run_id": {
+                    "type": "string",
+                    "description": (
+                        "run_id from the train tool result (e.g. 'run_20260416_211000_a1b2c3'). "
+                        "Pass 'latest' to replay the most recent successful run."
+                    ),
+                },
+                "num_frames": {
+                    "type": "integer",
+                    "description": "Number of frames to render (default 150, ~5 s at 30 fps)",
+                    "default": 150,
+                },
+                "render_video": {
+                    "type": "boolean",
+                    "description": "Save an MP4 of the rollout to workspace/renders/",
+                    "default": False,
+                },
+            },
+            "required": ["run_id"],
+        },
+    },
+    {
+        "name": "promote_skill",
+        "description": (
+            "Promote a completed training run to a named skill in the Skills Library. "
+            "Copies the checkpoint from workspace/checkpoints/ into "
+            "workspace/skills/<robot>/<skill_id>/variants/<id>/policy/ and writes "
+            "skill.json + variant.json manifests. After this call the skill appears "
+            "in the Skills Library panel and can be composed into policies. "
+            "Call this after a successful train run when the user wants to save the "
+            "behavior as a reusable skill."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "run_id": {
+                    "type": "string",
+                    "description": (
+                        "run_id of the training run to promote "
+                        "(e.g. 'run_20260417_013607_e7ee54'). "
+                        "Pass 'latest' to promote the most recent successful run."
+                    ),
+                },
+                "skill_id": {
+                    "type": "string",
+                    "description": (
+                        "Slug identifier for the skill (e.g. 'walk_forward'). "
+                        "Will be lowercased and slugified automatically."
+                    ),
+                },
+                "display_name": {
+                    "type": "string",
+                    "description": "Human-readable name shown in the Skills Library (e.g. 'Walk Forward').",
+                },
+                "task_description": {
+                    "type": "string",
+                    "description": "One-sentence description of what the skill does.",
+                },
+            },
+            "required": ["run_id", "skill_id", "display_name"],
         },
     },
     {

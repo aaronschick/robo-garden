@@ -50,6 +50,12 @@ APPROVED_DIR.mkdir(exist_ok=True)
 RUNS_DIR = WORKSPACE_DIR / "runs"
 RUNS_DIR.mkdir(exist_ok=True)
 
+SKILLS_DIR = WORKSPACE_DIR / "skills"
+SKILLS_DIR.mkdir(exist_ok=True)
+
+POLICIES_DIR = WORKSPACE_DIR / "policies"
+POLICIES_DIR.mkdir(exist_ok=True)
+
 DATA_DIR = Path(__file__).parent / "data"
 
 # API configuration

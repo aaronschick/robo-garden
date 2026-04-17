@@ -81,6 +81,28 @@ def load_recent(limit: int = 20, path: Path | None = None) -> list[dict]:
     return records[:max(0, int(limit))]
 
 
+def find_run(run_id: str, path: Path | None = None) -> dict | None:
+    """Return the first run record matching *run_id*, or None if not found."""
+    target = path or RUNS_FILE
+    if not target.exists():
+        return None
+    try:
+        with target.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    if record.get("run_id") == run_id:
+                        return record
+                except json.JSONDecodeError:
+                    continue
+    except Exception as exc:
+        log.warning(f"Could not search run history in {target}: {exc}")
+    return None
+
+
 def filter_runs(
     records: Iterable[dict],
     *,

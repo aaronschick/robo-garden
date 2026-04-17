@@ -40,6 +40,8 @@ TRAINING_TOOL_NAMES: frozenset[str] = frozenset({
     "generate_environment",
     "generate_reward",
     "train",
+    "review_run",
+    "promote_skill",
     "query_catalog",
     "approve_for_training",
 })

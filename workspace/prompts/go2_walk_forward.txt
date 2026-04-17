@@ -1,0 +1,56 @@
+The go2_walker quadruped robot MJCF is already saved at workspace/robots/go2_walker.xml.
+Do NOT call generate_robot — the file is already in the workspace.
+
+Work through these steps automatically without asking for confirmation at each one:
+
+STEP 1 — Simulate the existing robot to verify passive stability:
+  Call simulate(robot_name="go2_walker", duration_seconds=2.0)
+
+STEP 2 — Create a flat terrain environment:
+  Call generate_environment with name="flat_ground" and this MJCF:
+  <mujoco>
+    <option timestep="0.002" gravity="0 0 -9.81"/>
+    <worldbody>
+      <light name="sun" pos="0 0 4" dir="0 0 -1" directional="true" diffuse="0.8 0.8 0.8"/>
+      <geom name="floor" type="plane" size="50 50 0.1" friction="1.0 0.005 0.0001"
+            rgba="0.55 0.6 0.5 1" contype="1" conaffinity="1"/>
+    </worldbody>
+  </mujoco>
+
+STEP 3 — Approve for training:
+  Call approve_for_training(robot_name="go2_walker", environment_name="flat_ground",
+    notes="Go2 quadruped on flat ground, passive sim stable")
+
+STEP 4 — Generate a quadruped walking reward:
+  The go2_walker has nq=19, nv=18, nu=12.
+  obs = concat(qpos, qvel), shape (37,):
+    obs[0:3]  = trunk xyz position (floating base)
+    obs[3:7]  = trunk quaternion [qw, qx, qy, qz]
+    obs[7:19] = 12 joint positions (FR_hip, FR_thigh, FR_calf, FL, RR, RL x3)
+    obs[19:25]= trunk linear + angular velocity [vx, vy, vz, wx, wy, wz]
+    obs[25:37]= 12 joint velocities
+  action shape (12,) in [-1,1], scaled to [-23.7, 23.7] Nm per joint.
+
+  Write a JAX-compatible reward (use np.where not if/else on obs values) that:
+  - Maximises forward velocity: obs[19] (x-linear vel), target ~1.5 m/s
+  - Penalises lateral drift: obs[20]^2 (y-linear vel)
+  - Penalises body tilt: (1 - obs[3])^2 (qw should stay near 1.0)
+  - Penalises trunk height drop below 0.35m: np.where(obs[2] < 0.35, ...)
+  - Penalises torque use: np.sum(np.square(action)) * 0.0005
+
+  IMPORTANT: also define compute_done(next_obs) -> bool in the same code block:
+  - Return True when obs[2] (trunk z) < 0.15 (robot has collapsed)
+  - This enables early episode termination so the policy gets clean reward signal
+  Example:
+    def compute_done(next_obs):
+        return bool(next_obs[2] < 0.15)
+
+STEP 5 — Start training:
+  Call train(robot_name="go2_walker", environment_name="flat_ground",
+    reward_function_id=<id from step 4>,
+    total_timesteps=1000000, num_envs=64)
+
+After training completes:
+- Call review_run(run_id="latest", render_video=True) to replay the policy
+- Report the best_reward and suggest whether to refine the reward (use the
+  eureka_refinement field in the train result to guide your next generate_reward call)
