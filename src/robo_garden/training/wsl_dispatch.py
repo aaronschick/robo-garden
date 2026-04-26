@@ -203,6 +203,11 @@ def run_in_wsl(
     # shell profile so uv is on PATH, pin the ext4 venv location so we
     # don't clobber the Windows-side .venv, and fix COLUMNS so Rich doesn't
     # shred stdout one character at a time when captured through a pipe.
+    brax_timeout_env = ""
+    host_brax_timeout = os.environ.get("ROBO_GARDEN_BRAX_TIMEOUT")
+    if host_brax_timeout:
+        brax_timeout_env = f'export ROBO_GARDEN_BRAX_TIMEOUT="{host_brax_timeout}"; '
+
     source_profile = (
         'source "$HOME/.profile" 2>/dev/null; '
         'source "$HOME/.cargo/env" 2>/dev/null; '
@@ -210,6 +215,7 @@ def run_in_wsl(
         'export PYTHONIOENCODING=utf-8 PYTHONUNBUFFERED=1; '
         'export COLUMNS=120 LINES=40; '
         'export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$HOME/.cache/robo-garden/venv}"; '
+        f"{brax_timeout_env}"
     )
     worker_cmd = (
         f"cd '{wsl_project}' && "

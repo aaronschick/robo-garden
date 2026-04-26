@@ -15,11 +15,11 @@ actuators:
   - id: dynamixel_xl330_m288
     name: "Dynamixel XL330-M288-T"
     type: servo
-    torque_nm: 0.42
+    torque_nm: 0.52
     speed_rpm: 103
     voltage: 5.0
-    weight_g: 18.5
-    price_usd: 24.00
+    weight_g: 18.0
+    price_usd: 27.49
     max_angle_deg: 360
     interface: ttl
     source: robotis
@@ -28,11 +28,11 @@ actuators:
   - id: dynamixel_xl430_w250
     name: "Dynamixel XL430-W250-T"
     type: servo
-    torque_nm: 1.5
+    torque_nm: 1.4
     speed_rpm: 57
     voltage: 11.1
-    weight_g: 57.2
-    price_usd: 49.90
+    weight_g: 65.0
+    price_usd: 27.50
     max_angle_deg: 360
     interface: ttl
     source: robotis

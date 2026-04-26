@@ -1,0 +1,297 @@
+"""W6 (2026-04-25) — Locomotion atlas analysis.
+
+Loads the atlas dataframe produced by `w6_atlas_run.py`, generates 2D
+heatmap projections over `(rear_push_amp, front_retract_amp)` (the two
+axes the deep-research report calls out as primary), and writes a top-10
+shortlist + a markdown report.
+
+Output dir: workspace/_tasks_out/w6_atlas/
+    heatmap_displacement.png     net_displacement_m
+    heatmap_slip.png             mean_slip_ratio
+    heatmap_cot.png              mean_cot
+    top10.csv                    top 10 by displacement
+                                 ∩ slip < 0.3 ∩ cot < 5
+    report.md                    narrative + decision rule
+
+Pure pandas + matplotlib if available; falls back to CSV-only output if
+matplotlib is missing. Importable on Windows. No Isaac Lab.
+
+Usage:
+    uv run python workspace/scratch/w6_atlas_analysis.py
+    uv run python workspace/scratch/w6_atlas_analysis.py \\
+        --atlas workspace/_tasks_out/w6_atlas/atlas.csv \\
+        --output-dir workspace/_tasks_out/w6_atlas
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+
+def _load_atlas(path: Path):
+    """Load an atlas file. Prefers `path` exactly; falls back to the
+    sibling .parquet/.csv if `path` is missing OR if the parquet engine
+    is unavailable (no pyarrow/fastparquet installed)."""
+    import pandas as pd
+
+    pq = path if path.suffix.lower() == ".parquet" else path.with_suffix(".parquet")
+    csv_p = path if path.suffix.lower() == ".csv" else path.with_suffix(".csv")
+
+    # Try parquet first if it exists, but if pandas can't decode it,
+    # silently fall through to the CSV sibling.
+    if pq.exists():
+        try:
+            return pd.read_parquet(pq)
+        except ImportError:
+            print("[w6-analysis] parquet engine unavailable; falling "
+                  "back to CSV sibling.", file=sys.stderr)
+    if csv_p.exists():
+        return pd.read_csv(csv_p)
+    raise SystemExit(f"[w6-analysis] cannot find atlas at {pq} or {csv_p}")
+
+
+def _have_matplotlib() -> bool:
+    try:
+        import matplotlib  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _heatmap_2d(
+    df, x_col: str, y_col: str, val_col: str,
+    out_path: Path, *,
+    bins: int = 8, cmap: str = "viridis", title: str | None = None,
+) -> None:
+    """Bin the dataframe on (x_col, y_col) into `bins`x`bins` cells, take
+    the mean of `val_col` per cell, and save as a PNG heatmap.
+
+    The mean-over-bin marginalises over the OTHER LHS dimensions, which
+    is the standard way to read a 2D slice out of a higher-D LHS sweep.
+    """
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    x = df[x_col].to_numpy()
+    y = df[y_col].to_numpy()
+    v = df[val_col].to_numpy()
+
+    x_edges = np.linspace(x.min(), x.max(), bins + 1)
+    y_edges = np.linspace(y.min(), y.max(), bins + 1)
+
+    grid_sum = np.zeros((bins, bins), dtype=np.float64)
+    grid_n = np.zeros((bins, bins), dtype=np.int64)
+    xi = np.clip(np.digitize(x, x_edges) - 1, 0, bins - 1)
+    yi = np.clip(np.digitize(y, y_edges) - 1, 0, bins - 1)
+    for i, j, val in zip(xi, yi, v):
+        grid_sum[j, i] += val
+        grid_n[j, i] += 1
+    grid_mean = np.where(grid_n > 0, grid_sum / np.maximum(grid_n, 1),
+                         np.nan)
+
+    fig, ax = plt.subplots(figsize=(6.5, 5.5))
+    im = ax.imshow(
+        grid_mean,
+        origin="lower",
+        extent=[x.min(), x.max(), y.min(), y.max()],
+        aspect="auto",
+        cmap=cmap,
+    )
+    ax.set_xlabel(x_col)
+    ax.set_ylabel(y_col)
+    ax.set_title(title or f"{val_col} (mean per {bins}x{bins} bin)")
+    fig.colorbar(im, ax=ax, label=val_col)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    print(f"[w6-analysis] wrote {out_path}")
+
+
+def _basin_summary(df) -> dict:
+    """Return summary stats for the basin decision rule."""
+    import numpy as np
+
+    n = len(df)
+    in_basin = df[
+        (df["net_displacement_m"] > 0.15 * 4.0)        # speed proxy: 0.15 m/s × 4s = 0.6 m
+        & (df["mean_slip_ratio"] < 0.3)
+        & (df["mean_cot"] < 5.0)
+    ]
+    return {
+        "n_total": int(n),
+        "n_in_basin": int(len(in_basin)),
+        "frac_in_basin": float(len(in_basin) / max(1, n)),
+        "max_displacement": float(df["net_displacement_m"].max()),
+        "min_slip": float(df["mean_slip_ratio"].min()),
+        "min_cot_pos_speed": float(
+            df.loc[df["mean_speed_mps"] > 0.05, "mean_cot"].min()
+        ) if (df["mean_speed_mps"] > 0.05).any() else float("nan"),
+        "n_success": int(df["success"].sum()) if "success" in df else 0,
+    }
+
+
+def _write_report(out_dir: Path, df, summary: dict, top10) -> Path:
+    md = []
+    md.append("# W6 Locomotion Atlas — Analysis\n")
+    md.append(
+        "Auto-generated by `workspace/scratch/w6_atlas_analysis.py` from "
+        "the per-sample run-time output of `w6_atlas_run.py`.\n"
+    )
+    md.append("## Sweep stats\n")
+    md.append(f"- Total samples: **{summary['n_total']}**")
+    md.append(f"- Success (`net_disp > 0.5m AND speed > 0.1 m/s`): "
+              f"**{summary['n_success']}** "
+              f"({100 * summary['n_success'] / max(1, summary['n_total']):.1f}%)")
+    md.append(f"- In basin (`disp > 0.6m AND slip < 0.3 AND cot < 5`): "
+              f"**{summary['n_in_basin']}** "
+              f"({100 * summary['frac_in_basin']:.1f}%)")
+    md.append(f"- Max net displacement: **{summary['max_displacement']:.3f} m**")
+    md.append(f"- Min slip ratio: **{summary['min_slip']:.3f}**")
+    md.append(f"- Min COT (at non-zero speed): "
+              f"**{summary['min_cot_pos_speed']:.3f}**")
+    md.append("")
+
+    md.append("## Decision rule\n")
+    md.append(
+        "Per the plan §W6 acceptance: \"exists a connected basin of "
+        "(displacement > 0.15 m/s, slip < 0.3, COT < 5)?\"\n"
+    )
+    if summary["n_in_basin"] >= 5:
+        md.append(
+            f"**VERDICT: PASS.** {summary['n_in_basin']} samples fall in the "
+            "basin. The top-10 shortlist (`top10.csv`) is the candidate "
+            "seed library for W7 closed-loop tuning and W8 BC re-record.\n"
+        )
+    elif summary["n_in_basin"] >= 1:
+        md.append(
+            f"**VERDICT: BORDERLINE.** Only {summary['n_in_basin']} sample(s) "
+            "qualify. Either the basin is genuinely tiny (run a denser sweep "
+            "around the qualifying samples) or the controller still needs "
+            "more knobs unlocked.\n"
+        )
+    else:
+        md.append(
+            "**VERDICT: FAIL.** No samples meet the basin criteria. Inspect "
+            "the heatmaps for partial-success regions, then either widen "
+            "the LHS ranges or revisit the W3 controller before proceeding "
+            "to W7/W8.\n"
+        )
+
+    md.append("## Heatmaps\n")
+    md.append("- `heatmap_displacement.png` — `net_displacement_m`")
+    md.append("- `heatmap_slip.png` — `mean_slip_ratio`")
+    md.append("- `heatmap_cot.png` — `mean_cot`\n")
+    md.append(
+        "All heatmaps are 2D bins over `(rear_push_amp, front_retract_amp)`, "
+        "marginalising over `lean_phase`, `phase_velocity_hz`, and `push_duty`.\n"
+    )
+
+    md.append("## Top-10 shortlist\n")
+    md.append(
+        "Top 10 samples by `net_displacement_m`, filtered to "
+        "`mean_slip_ratio < 0.3 AND mean_cot < 5`. See `top10.csv` for "
+        "the full row data.\n"
+    )
+    if len(top10) > 0:
+        try:
+            md.append(top10.to_markdown(index=False, floatfmt=".3f"))
+        except ImportError:
+            # `tabulate` not installed — emit a manual pipe-table.
+            cols = list(top10.columns)
+            md.append("| " + " | ".join(cols) + " |")
+            md.append("|" + "|".join(["---"] * len(cols)) + "|")
+            for _, r in top10.iterrows():
+                cells = []
+                for c in cols:
+                    v = r[c]
+                    if isinstance(v, (int, bool)):
+                        cells.append(str(v))
+                    elif isinstance(v, float):
+                        cells.append(f"{v:.3f}")
+                    else:
+                        cells.append(str(v))
+                md.append("| " + " | ".join(cells) + " |")
+    else:
+        md.append("_(empty — no samples cleared both filters)_")
+    md.append("")
+
+    out = out_dir / "report.md"
+    out.write_text("\n".join(md), encoding="utf-8")
+    print(f"[w6-analysis] wrote {out}")
+    return out
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--atlas", type=Path,
+        default=Path("workspace/_tasks_out/w6_atlas/atlas.parquet"),
+        help="Atlas parquet/csv produced by w6_atlas_run.py.",
+    )
+    parser.add_argument(
+        "--output-dir", type=Path,
+        default=Path("workspace/_tasks_out/w6_atlas"),
+        dest="output_dir",
+    )
+    parser.add_argument("--bins", type=int, default=8)
+    args = parser.parse_args(argv)
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    df = _load_atlas(args.atlas)
+    print(f"[w6-analysis] loaded atlas: {len(df)} rows, "
+          f"cols={list(df.columns)}")
+
+    required = {
+        "rear_push_amp", "front_retract_amp", "net_displacement_m",
+        "mean_slip_ratio", "mean_cot", "mean_speed_mps",
+    }
+    missing = required - set(df.columns)
+    if missing:
+        raise SystemExit(f"[w6-analysis] atlas missing required columns: "
+                         f"{missing}")
+
+    # Top-10 shortlist (filter then sort).
+    filt = df[(df["mean_slip_ratio"] < 0.3) & (df["mean_cot"] < 5.0)].copy()
+    filt = filt.sort_values("net_displacement_m", ascending=False)
+    top10 = filt.head(10)
+    top10_path = args.output_dir / "top10.csv"
+    top10.to_csv(top10_path, index=False)
+    print(f"[w6-analysis] wrote {top10_path} ({len(top10)} rows)")
+
+    # Heatmaps.
+    if _have_matplotlib():
+        _heatmap_2d(
+            df, "rear_push_amp", "front_retract_amp", "net_displacement_m",
+            args.output_dir / "heatmap_displacement.png",
+            bins=args.bins, cmap="viridis",
+            title="Net displacement (m) — mean per bin",
+        )
+        _heatmap_2d(
+            df, "rear_push_amp", "front_retract_amp", "mean_slip_ratio",
+            args.output_dir / "heatmap_slip.png",
+            bins=args.bins, cmap="magma",
+            title="Mean slip ratio — mean per bin",
+        )
+        _heatmap_2d(
+            df, "rear_push_amp", "front_retract_amp", "mean_cot",
+            args.output_dir / "heatmap_cot.png",
+            bins=args.bins, cmap="cividis",
+            title="Mean cost-of-transport — mean per bin",
+        )
+    else:
+        print("[w6-analysis] matplotlib unavailable; skipping heatmaps. "
+              "CSV-only outputs.", file=sys.stderr)
+
+    summary = _basin_summary(df)
+    _write_report(args.output_dir, df, summary, top10)
+
+    print(f"[w6-analysis] DONE  output_dir={args.output_dir.resolve()}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

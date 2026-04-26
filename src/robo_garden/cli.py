@@ -989,6 +989,17 @@ def main():
             # gives the policy time to push the trunk forward several body
             # lengths before truncation.
             locomotion_horizon = 2500
+        elif robot_name == "urchin_v2":
+            from robo_garden.training.gym_env import (
+                urchin_v2_reward,
+                urchin_v2_reward_jax,
+            )
+            reward_fn = urchin_v2_reward
+            jax_reward_fn = urchin_v2_reward_jax
+            # Same rationale as go2_walker: rolling a 30 cm ball from rest
+            # takes a couple of seconds of coordinated voice-coil activity,
+            # and 1 s episodes truncate before the policy ever sees motion.
+            locomotion_horizon = 2500
 
         # ``--approved`` is consumed by --mode gym; in --mode train we only use
         # it as a context string for logging so users are not silently confused

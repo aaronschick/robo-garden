@@ -31,6 +31,13 @@ workspace/runs/
 workspace/renders/
 workspace/environments/
 workspace/_wsl_jobs/
+workspace/_tasks_out/
+workspace/datasets/
+workspace/eval/
+workspace/rewards/
+workspace/videos/
+workspace/_tmp_*.log
+workspace/scratch/__pycache__/
 
 # Claude local config / scheduled-task lockfiles
 .claude/

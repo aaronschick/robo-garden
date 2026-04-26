@@ -50,3 +50,61 @@ actuators:
     interface: canbus
     source: myactuator
     url: "https://www.myactuator.com/product-page/rmd-x8"
+
+  - id: robstride_03
+    name: "Robstride 03 QDD Integrated Actuator"
+    type: bldc
+    torque_nm: 60.0
+    speed_rpm: 195
+    voltage: 48.0
+    weight_g: 880.0
+    price_usd: 269.00
+    max_angle_deg: null
+    interface: canbus
+    source: robstride
+    url: "https://robstride.com/"
+    # Peak torque 60 N*m (rated 20 N*m), 195 rpm no-load, 180 rpm at rated
+    # load, 15-60V range (optimal 48V). 9:1 planetary reducer, dual 14-bit
+    # magnetic encoders, IP52, 880g +/- 20g. CAN2.0 debug via XT30 + GH1.25
+    # connector. Direct competitor to the mjbots qdd100 at half the price.
+    # Often referred to as "MS03" in community docs; catalogued here as the
+    # vendor's "Robstride 03" product family.
+
+  - id: tmotor_gb36_1
+    name: "T-motor GB36-1 Gimbal BLDC (50 KV)"
+    type: bldc
+    torque_nm: 0.24
+    speed_rpm: 600
+    voltage: 14.8
+    weight_g: 88.0
+    price_usd: 49.90
+    max_angle_deg: null
+    interface: three_phase
+    source: tmotor
+    url: "https://store.tmotor.com/product/gb36-1-gimbal-type.html"
+    # 12N14P gimbal-type BLDC, 50 KV, 3-6S LiPo (11.1-22.2V). Hollow 5.6mm
+    # shaft. 41.8 x 24.3 mm envelope. Peak torque 0.24 N*m (quoted as
+    # ~5 kg*cm at 4S in T-motor marketing). Requires a closed-loop BLDC
+    # driver with encoder (SimpleFOC, ODrive Micro, VESC Mini). Low-KV
+    # gimbal motor characteristic: smooth, high-torque-at-zero-speed, good
+    # for expressive head/limb motion on small character robots.
+    # speed_rpm conservative at 600 (14.8V * 50 KV = 740 no-load, derated).
+
+  - id: ipower_gm2804
+    name: "iPower GM2804 Gimbal BLDC"
+    type: bldc
+    torque_nm: 0.034
+    speed_rpm: 1600
+    voltage: 11.1
+    weight_g: 42.3
+    price_usd: 21.99
+    max_angle_deg: null
+    interface: three_phase
+    source: ipower
+    url: "https://shop.iflight.com/ipower-gm2804-gimbal-motor-pro1153"
+    # 12N14P micro gimbal motor, Ф35 x 25 mm. Load torque 250-350 g*cm =
+    # 0.025-0.034 N*m. 2-3S (7.4-11.1V) working range, 25W max power. No-load
+    # ~1600 rpm at 10V. 8/6.5 mm hollow shaft. Pair with AS5048A encoder
+    # board (+$8) for closed-loop FOC. Very light (42g) — smallest BLDC in
+    # this catalog, for high-bandwidth eye/antenna movement or tiny
+    # backdrivable joints. Also sold as iFlight GM2804 / Rctimer GBM2804.

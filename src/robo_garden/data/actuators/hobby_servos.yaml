@@ -76,3 +76,22 @@ actuators:
     interface: ttl
     source: lewansoul
     url: ""
+
+  - id: feetech_sts3215
+    name: "Feetech STS3215 7.4V Serial Bus Servo"
+    type: servo
+    torque_nm: 1.91
+    speed_rpm: 50
+    voltage: 7.4
+    weight_g: 55.0
+    price_usd: 21.99
+    max_angle_deg: 360
+    interface: ttl
+    source: feetech
+    url: "https://www.seeedstudio.com/STS3215-19kg-cm-7-4V-Serial-Servo-p-6338.html"
+    # Stall torque 19.5 kg*cm = 1.91 N*m at 7.4V. Metal gear, 1:345 reduction,
+    # 12-bit magnetic encoder, 0-4096 step resolution over 360 deg. Popular in
+    # Hugging Face LeRobot / SO-ARM100 arm kits. A 12V variant exists at 30 kg*cm
+    # (2.94 N*m). No-load speed ~0.2 s/60 deg -> ~50 rpm. Interface is Feetech's
+    # half-duplex TTL serial bus (38400-1000000 bps), compatible with the
+    # waveshare ST3215 driver ecosystem.

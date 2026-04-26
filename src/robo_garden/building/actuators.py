@@ -47,9 +47,10 @@ def query_actuators(
     results = load_catalog()
 
     if min_torque_nm is not None:
-        results = [a for a in results if a.torque_nm >= min_torque_nm]
+        # Linear actuators have torque_nm = None; exclude them from a torque query.
+        results = [a for a in results if a.torque_nm is not None and a.torque_nm >= min_torque_nm]
     if max_weight_g is not None:
-        results = [a for a in results if a.weight_g <= max_weight_g]
+        results = [a for a in results if a.weight_g is not None and a.weight_g <= max_weight_g]
     if actuator_type is not None:
         results = [a for a in results if a.type == actuator_type]
     if max_price_usd is not None:

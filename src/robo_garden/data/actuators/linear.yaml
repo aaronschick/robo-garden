@@ -1,0 +1,173 @@
+# Linear actuators — stroke-based actuators (linear servos, ball-screw stages,
+# voice-coils, custom BLDC + rack).
+#
+# SCHEMA NOTE (flag for Agent B3 / validator extension):
+#   The canonical Actuator dataclass in src/robo_garden/building/models.py
+#   has REQUIRED `torque_nm` and `speed_rpm` fields and no `force_n`,
+#   `speed_mps`, or `stroke_mm` fields. Loading this file with the current
+#   loader (building/actuators.py) will raise TypeError: unexpected keyword
+#   argument 'force_n'. The planned fix is to extend the Actuator model
+#   with an optional `force_n`, `speed_mps`, `stroke_mm` triple (all default
+#   None) and relax `torque_nm`/`speed_rpm` to Optional for `type: linear`.
+#   Until then this YAML is data-only documentation of the shortlist and is
+#   excluded from the loader via the validator's type filter — Agent B3 must
+#   wire that up.
+#
+# Convention for linear entries (rotary fields kept null):
+#   type: linear
+#   force_n: peak force in Newtons (null if unverified)
+#   speed_mps: max linear speed in meters per second (null if unverified)
+#   stroke_mm: usable stroke in millimeters
+#   torque_nm: null      (not meaningful for a linear axis)
+#   speed_rpm: null
+#   max_angle_deg: null
+
+actuators:
+  - id: odrive_s1_rack_and_pinion_ref
+    name: "ODrive S1 + M8325s BLDC + 4mm pinion rack (custom reference design)"
+    type: linear
+    force_n: 90.0
+    speed_mps: 0.65
+    stroke_mm: 60
+    torque_nm: null
+    speed_rpm: null
+    voltage: 24.0
+    weight_g: 250.0
+    price_usd: 235.00
+    max_angle_deg: null
+    interface: canbus
+    source: odrive
+    url: "https://shop.odriverobotics.com/products/odrive-s1"
+    notes: >-
+      Reference DIY build from docs/design_review/actuator_shortlist.md,
+      Candidate A. Force = motor torque (0.34 N*m) through a 4 mm pinion at
+      ~20:1 effective belt reduction. Speed derived from 7000 rpm no-load at
+      4 mm/rev linear = ~650 mm/s. Motor weight ~180 g + rack/housing ~70 g.
+      Price = ODrive S1 ($149) + M8325s motor (~$60) + printed rack + bearings
+      (~$25). Feedback via ODrive's integrated 16384 CPR magnetic encoder.
+      Requires ~40 hours of custom CAD per unit; do NOT treat as off-the-shelf.
+      Linear-stage weight is estimated — measure after a prototype build.
+
+  - id: stepperonline_lk60_40dl10s3_110
+    name: "StepperOnline LK60-40DL10S3-110 Ball-Screw Linear Stage (110 mm)"
+    type: linear
+    force_n: 196.0
+    speed_mps: 0.5
+    stroke_mm: 110
+    torque_nm: null
+    speed_rpm: null
+    voltage: 24.0
+    weight_g: null
+    price_usd: null
+    max_angle_deg: null
+    interface: step_dir
+    source: stepperonline
+    url: "https://www.omc-stepperonline.com/lk60-series-ball-screw-driven-max-horizontal-vertical-payload-20kg-6kg-stroke-110mm-for-servo-motor-lk60-40dl10s3-110"
+    notes: >-
+      LK60 ball-screw stage, 20 kg horizontal payload (~196 N) / 6 kg vertical
+      (~59 N), 500 mm/s max linear speed per StepperOnline catalog text. Ships
+      as a stage without a motor — couple to a NEMA-23 closed-loop stepper or
+      NEMA-24 servo (add ~$60-$130). 510 mm stroke sibling (LK60-23DL103-510)
+      is listed at $155.52 on the StepperOnline site; 110 mm variant price
+      and stage weight are not displayed on the public listing (WebFetch 403).
+      FLAG: verify price + stage weight manually before quoting a BoM.
+
+  - id: sensata_las28_53_vca
+    name: "Sensata BEI Kimco LAS28-53-000A-P01-12E Voice Coil Actuator"
+    type: linear
+    force_n: 266.9
+    speed_mps: 2.0
+    stroke_mm: 25
+    torque_nm: null
+    speed_rpm: null
+    voltage: 12.0
+    weight_g: null
+    price_usd: null
+    max_angle_deg: null
+    interface: analog_current
+    source: sensata_bei_kimco
+    url: "https://www.sensata.com/products/motors-actuators/cylindrical-housed-linear-vca-integrated-sensor-las28-53-000a-p01-12e"
+    notes: >-
+      Cylindrical housed VCA with integrated Hall-effect position sensor.
+      RS Online listing confirms 25 mm stroke + 266.9 N peak force — NOT the
+      53 mm / 60 N figure in the original design_review/actuator_shortlist.md
+      (the "-53" in the model number is housing length, not stroke). Continuous
+      force is lower (VCA duty-cycle derating; exact figure requires manufacturer
+      datasheet — WebFetch 403 on Sensata pages). Peak velocity is VCA-class
+      (>2 m/s feasible, driver-limited). Needs a current-mode driver (e.g.
+      Copley Xenus, A-M-C AZBE; add ~$350). No published unit price at retail;
+      developer kit (DK-LAS28-53-000A-P01-12E) runs ~$1,200-1,500. FLAG: quote
+      Sensata direct for per-unit pricing at qty >= 12.
+
+  - id: actuonix_l16_r_100mm_150_1
+    name: "Actuonix L16-R 100 mm 150:1 12V RC Linear Servo"
+    type: linear
+    force_n: 200.0
+    speed_mps: 0.008
+    stroke_mm: 100
+    torque_nm: null
+    speed_rpm: null
+    voltage: 12.0
+    weight_g: 74.0
+    price_usd: 75.00
+    max_angle_deg: null
+    interface: pwm
+    source: actuonix
+    url: "https://www.actuonix.com/l16"
+    notes: >-
+      Hobby-grade catalog floor. L16-R takes a standard 1-2 ms RC PWM pulse
+      like an RC servo and drives a lead screw. 150:1 gearbox variant: 200 N
+      max lifted force, 8 mm/s no-load at 12 V. Other gearings in the same
+      family: 35:1 (50 N @ 32 mm/s) and 63:1 (midpoint). Also available in
+      50 mm and 140 mm stroke. Price varies $70-$85 depending on stroke and
+      vendor (Actuonix direct / RobotShop / SparkFun). Weight and 150:1
+      datasheet values per RobotShop listing. DISQUALIFIED for urchin-class
+      shape-shifting (too slow by 10-50x) but useful as a low-cost linear
+      primitive for slower robots.
+
+  - id: actuonix_pq12_63_1
+    name: "Actuonix PQ12-P 20 mm 63:1 12V Micro Linear Actuator"
+    type: linear
+    force_n: 45.0
+    speed_mps: 0.015
+    stroke_mm: 20
+    torque_nm: null
+    speed_rpm: null
+    voltage: 12.0
+    weight_g: 15.0
+    price_usd: 80.00
+    max_angle_deg: null
+    interface: pwm
+    source: actuonix
+    url: "https://www.actuonix.com/PQ12-Micro-Linear-Actuators-s/1825.htm"
+    notes: >-
+      Micro linear actuator for small-scale / character-robot joints. 63:1
+      variant: 45 N max force, 15 mm/s no-load. 30:1 sibling trades force for
+      speed (18 N @ 28 mm/s). 20 mm stroke, 15 g, 50x15x20 mm envelope.
+      PQ12-P variant has a potentiometer for position feedback. Price varies
+      $75-$90 depending on retailer (Actuonix, SparkFun, ACT-U8). Only linear
+      actuator in this catalog light enough for a sub-100 g robot joint.
+
+  - id: firgelli_l12_r_50mm_100_1
+    name: "Firgelli/Actuonix L12-R 50 mm 100:1 12V RC Linear Actuator"
+    type: linear
+    force_n: 42.0
+    speed_mps: 0.012
+    stroke_mm: 50
+    torque_nm: null
+    speed_rpm: null
+    voltage: 12.0
+    weight_g: 34.0
+    price_usd: 70.00
+    max_angle_deg: null
+    interface: pwm
+    source: actuonix
+    url: "https://www.actuonix.com/l12"
+    notes: >-
+      Step between PQ12 and L16 in Actuonix's catalog. 100:1 gearbox: 42 N
+      max force, 12 mm/s no-load. Also sold in 30:1 (22 N @ 23 mm/s) and
+      210:1 (80 N @ 5.7 mm/s). Useful mid-point for robots that want more
+      stroke than PQ12 but can't afford L16's weight. FLAG: spec values from
+      Actuonix datasheet summary; confirm exact 100:1 value against the
+      current published datasheet before committing to a BoM (WebFetch 404
+      on direct product pages during this catalog update).

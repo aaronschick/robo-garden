@@ -268,6 +268,59 @@ def go2_walker_done_jax(next_obs):
 
 
 # ---------------------------------------------------------------------------
+# Urchin v2 (spherical 30-voice-coil ball) helpers
+# ---------------------------------------------------------------------------
+#
+# Observation layout (workspace/robots/urchin_v2.xml): obs = [qpos, qvel]
+# with nq=49, nv=48, obs_dim=97.
+#   qpos[0:3]    = shell xyz          qvel[0:3]    = shell linear velocity
+#   qpos[3:7]    = shell quat         qvel[3:6]    = shell angular velocity
+#   qpos[7:19]   = 12 passive sol ext qvel[6:18]   = 12 passive sol velocities
+#   qpos[19:49]  = 30 voice-coil ext  qvel[18:48]  = 30 voice-coil velocities
+#
+# Action: 30 voice-coil motors (solenoid actuators disabled for Stage A
+# training; the 12 sol_* joints remain in the model as passive spring feet).
+
+_URCHIN_FLOOR_Z = 0.10         # below this the shell is clipping through the
+                               # ground plane; terminate / penalise heavily.
+
+
+def urchin_v2_reward(obs: np.ndarray, action: np.ndarray, next_obs: np.ndarray) -> float:
+    """NumPy reward for urchin_v2 free-rolling (SB3 / CPU path).
+
+    Encourages any XY motion up to 1.5 m/s, keeps the shell above the floor,
+    and gently penalises voice-coil chatter and raw actuator effort.
+    """
+    vx = float(next_obs[49])
+    vy = float(next_obs[50])
+    speed_xy = float(np.sqrt(vx * vx + vy * vy))
+    z = float(next_obs[2])
+    ctrl = np.asarray(action, dtype=np.float32)
+
+    r_speed = float(np.clip(speed_xy, 0.0, 1.5))
+    r_alive = 0.1 if z > _URCHIN_FLOOR_Z else -5.0
+    r_smooth = -0.005 * float(np.mean(np.abs(next_obs[67:97])))
+    r_energy = -0.001 * float(np.sum(ctrl * ctrl))
+    return r_speed + r_alive + r_smooth + r_energy
+
+
+def urchin_v2_reward_jax(obs, action, next_obs):
+    """JAX-native urchin_v2 reward — JIT-compilable for Brax PPO."""
+    import jax.numpy as jnp
+
+    vx = next_obs[49]
+    vy = next_obs[50]
+    speed_xy = jnp.sqrt(vx * vx + vy * vy)
+    z = next_obs[2]
+
+    r_speed = jnp.clip(speed_xy, jnp.float32(0.0), jnp.float32(1.5))
+    r_alive = jnp.where(z > jnp.float32(_URCHIN_FLOOR_Z), jnp.float32(0.1), jnp.float32(-5.0))
+    r_smooth = jnp.float32(-0.005) * jnp.mean(jnp.abs(next_obs[67:97]))
+    r_energy = jnp.float32(-0.001) * jnp.sum(action * action)
+    return r_speed + r_alive + r_smooth + r_energy
+
+
+# ---------------------------------------------------------------------------
 # Built-in reward source strings for --mode train WSL dispatch
 # ---------------------------------------------------------------------------
 # These are the compute_reward source strings that wsl_dispatch.run_in_wsl()
@@ -298,5 +351,18 @@ def compute_reward(obs, action, next_obs, info):
     r_term = -100.0 if z < 0.15 else 0.0
     r = 2.0 * r_forward + 1.0 * r_height + 0.5 * r_smooth + 0.1 * r_energy + r_term
     return float(r), {}
+""",
+    "urchin_v2": """\
+def compute_reward(obs, action, next_obs, info):
+    vx = next_obs[49]
+    vy = next_obs[50]
+    speed_xy = np.sqrt(vx * vx + vy * vy)
+    z = next_obs[2]
+    r_speed = np.clip(speed_xy, 0.0, 1.5)
+    r_alive = np.where(z > 0.10, 0.1, -5.0)
+    r_smooth = -0.005 * np.mean(np.abs(next_obs[67:97]))
+    r_energy = -0.001 * np.sum(action * action)
+    r = 1.0 * r_speed + r_alive + r_smooth + r_energy
+    return float(r), {"speed": speed_xy, "z": z}
 """,
 }

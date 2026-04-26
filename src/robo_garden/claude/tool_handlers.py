@@ -865,22 +865,32 @@ def handle_train(input: dict) -> dict:
         except Exception as exc:
             log.debug(f"rollout streaming failed at step {timestep}: {exc}")
 
-    # GPU training path: when ROBO_GARDEN_TRAIN_IN_WSL=1 on Windows, dispatch
-    # the whole run to a wsl.exe subprocess so Claude's reward executes against
-    # JAX/MJX/Brax with CUDA. Progress is piped back through the same
-    # ``_progress`` callback below (which drives the Isaac Sim training panel
-    # and history), so behaviour from Claude's point of view is unchanged —
-    # just faster. Rollout streaming is disabled in this path because the
-    # trained policy params live in the WSL process and aren't easy to
-    # marshal mid-training; we can revisit if the viewport rollouts become
-    # important during gym-mode runs.
-    from robo_garden.training import wsl_dispatch
+    # Isaac Lab path: robots with a USD-based Isaac Lab config (e.g. urchin_v2)
+    # train natively on Windows via the isaac-venv Python, skipping WSL and
+    # MuJoCo entirely. Progress is piped through the same _progress callback.
+    from robo_garden.training import isaac_lab_dispatch, wsl_dispatch
 
     error_text = ""
     success = False
     result = None
 
-    if wsl_dispatch.is_enabled():
+    if isaac_lab_dispatch.is_enabled(robot_name):
+        log.info(f"Routing '{robot_name}' to Isaac Lab training (run_id={run_id}).")
+        il_result = isaac_lab_dispatch.run_in_isaac_lab(
+            robot_name=robot_name,
+            total_timesteps=config.total_timesteps,
+            num_envs=config.num_envs,
+            run_id=run_id,
+            progress_callback=_progress,
+        )
+        success = bool(il_result.get("success", False))
+        error_text = str(il_result.get("error", ""))
+        best_reward = float(il_result.get("best_reward", float("-inf")))
+        reward_curve = list(il_result.get("reward_curve", []))
+        checkpoint_path = str(il_result.get("checkpoint_path", ""))
+        ended_at = _time.time()
+        training_time = float(il_result.get("training_time_seconds", ended_at - started_at))
+    elif wsl_dispatch.is_enabled():
         _wsl_flag = os.environ.get("ROBO_GARDEN_TRAIN_IN_WSL", "").strip()
         _wsl_reason = f"ROBO_GARDEN_TRAIN_IN_WSL={_wsl_flag}" if _wsl_flag else "WSL2 auto-detected"
         log.info(f"Dispatching training to WSL2 (run_id={run_id}) — {_wsl_reason}.")
